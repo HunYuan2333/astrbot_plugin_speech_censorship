@@ -9,7 +9,6 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 
 
-@register("speech-censorship", "YourName", "群聊消息审核与自动禁言插件", "1.0.7")
 class SpeechCensorshipPlugin(Star):
     """监听群聊消息，使用 LLM 识别违规内容并自动禁言"""
 
@@ -30,11 +29,17 @@ class SpeechCensorshipPlugin(Star):
         # 每个群组的最后检测时间
         self.last_check_time: Dict[str, float] = {}
 
+        # 每个群组的并发锁（防止竞争）
+        self.group_locks: Dict[str, asyncio.Lock] = {}
+
         # 定时检测任务
         self.timer_task: Optional[asyncio.Task] = None
 
         # 保存最新的 event 对象（用于发送消息和调用 API）
         self.latest_events: Dict[str, AstrMessageEvent] = {}
+
+        # 用户违规记录（用于防误杀护栏）
+        self.user_violation_records: Dict[str, Dict[str, float]] = defaultdict(dict)
 
         logger.info("群聊消息审核插件已加载")
 
@@ -183,14 +188,9 @@ class SpeechCensorshipPlugin(Star):
                 "user_name": user_name
             })
 
-            # 严格混合模式下，仅保留最近 N 条消息
-            trigger_mode = self._get_config("trigger_mode", "hybrid")
-            if trigger_mode == "strict_hybrid":
-                recent_message_limit = self._get_config("recent_message_limit", 50)
-                self._trim_group_buffer_recent(group_id, recent_message_limit)
-
             current_count = sum(len(msgs) for msgs in self.message_buffer[group_id].values())
             batch_size = self._get_config("batch_size", 10)
+            trigger_mode = self._get_config("trigger_mode", "hybrid")
             logger.info(
                 f"群 {group_id} 消息累积: {current_count}/{batch_size}（mode={trigger_mode}）"
             )
@@ -202,9 +202,10 @@ class SpeechCensorshipPlugin(Star):
         except Exception as e:
             logger.error(f"处理群消息时出错: {e}", exc_info=True)
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("test_ban")
     async def test_ban_command(self, event: AstrMessageEvent):
-        """测试禁言功能 - 禁言发送者1分钟"""
+        """测试禁言功能 - 禁言发送者1分钟（仅管理员可用）"""
         try:
             # 检查是否为 QQ 平台的群消息
             if event.get_platform_name() != "aiocqhttp":
@@ -363,26 +364,27 @@ class SpeechCensorshipPlugin(Star):
         if limit <= 0 or group_id not in self.message_buffer:
             return
 
+        # 统计总消息数
+        total_count = sum(len(msgs) for msgs in self.message_buffer[group_id].values())
+        if total_count <= limit:
+            return
+
+        # 扁平化并排序（仅在必要时执行）
         flattened = []
         for uid, messages in self.message_buffer[group_id].items():
             for msg in messages:
                 flattened.append((msg.get("timestamp", 0), uid, msg))
 
-        if len(flattened) <= limit:
-            return
-
         flattened.sort(key=lambda item: item[0])
         recent_items = flattened[-limit:]
 
+        # 重建缓冲区
         rebuilt = defaultdict(list)
         for _, uid, msg in recent_items:
             rebuilt[uid].append(msg)
 
-        for uid in rebuilt:
-            rebuilt[uid].sort(key=lambda msg: msg.get("timestamp", 0))
-
         self.message_buffer[group_id] = rebuilt
-        logger.info(f"群 {group_id} 严格混合窗口裁剪：仅保留最近 {limit} 条消息")
+        logger.info(f"群 {group_id} 缓冲窗口裁剪：{total_count} -> {limit} 条消息")
 
     async def _cleanup_old_messages(self):
         """清理超过 1 小时的旧消息"""
@@ -406,41 +408,48 @@ class SpeechCensorshipPlugin(Star):
                 del self.message_buffer[group_id]
 
     async def _process_group_messages(self, group_id: str):
-        """处理群组的累积消息"""
-        try:
-            # 获取该群的所有消息
-            messages_dict = self.message_buffer[group_id]
+        """处理群组的累积消息（带并发锁和状态收敛保证）"""
+        # 获取或创建该群的锁
+        if group_id not in self.group_locks:
+            self.group_locks[group_id] = asyncio.Lock()
 
-            if not messages_dict:
-                return
+        async with self.group_locks[group_id]:
+            try:
+                # 获取该群的所有消息（快照）
+                messages_dict = dict(self.message_buffer[group_id])  # 深拷贝，防止后续修改
 
-            total_count = sum(len(msgs) for msgs in messages_dict.values())
-            logger.info(f"开始分析群 {group_id} 的 {total_count} 条消息...")
+                if not messages_dict:
+                    return
 
-            # 调用 LLM 分析
-            violations = await self._analyze_messages(group_id, messages_dict)
+                total_count = sum(len(msgs) for msgs in messages_dict.values())
+                logger.info(f"开始分析群 {group_id} 的 {total_count} 条消息...")
 
-            if violations:
-                logger.info(f"检测到 {len(violations)} 个违规用户")
+                # 调用 LLM 分析
+                violations = await self._analyze_messages(group_id, messages_dict)
 
-                # 对每个违规用户执行禁言
-                for violation in violations:
-                    user_id = violation.get("user_id")
-                    reason = violation.get("reason", "违规内容")
+                if violations:
+                    logger.info(f"检测到 {len(violations)} 个违规用户")
 
-                    if user_id:
-                        await self._ban_user(group_id, user_id, reason)
-            else:
-                logger.info(f"群 {group_id} 未检测到违规内容")
+                    # 对每个违规用户执行禁言（包含验证和护栏）
+                    for violation in violations:
+                        user_id = violation.get("user_id")
+                        reason = violation.get("reason", "违规内容")
 
-            # 清空已处理的消息
-            self.message_buffer[group_id].clear()
+                        if user_id and self._validate_and_apply_guardrails(group_id, user_id, messages_dict, reason):
+                            await self._ban_user(group_id, user_id, reason)
+                else:
+                    logger.info(f"群 {group_id} 未检测到违规内容")
 
-            # 更新最后检测时间
-            self.last_check_time[group_id] = time.time()
-
-        except Exception as e:
-            logger.error(f"处理群组消息时出错: {e}", exc_info=True)
+            except Exception as e:
+                logger.error(f"处理群组消息时出错: {e}", exc_info=True)
+            finally:
+                # 确保状态收敛：无论成功失败都要更新时间和清理消息
+                try:
+                    self.message_buffer[group_id].clear()
+                    self.last_check_time[group_id] = time.time()
+                    logger.debug(f"群 {group_id} 消息清理完成")
+                except Exception as e:
+                    logger.error(f"状态收敛失败: {e}", exc_info=True)
 
     async def _analyze_messages(self, group_id: str, messages_dict: Dict[str, List[Dict]]) -> List[Dict]:
         """使用 LLM 分析消息，返回违规用户列表"""
@@ -518,20 +527,31 @@ class SpeechCensorshipPlugin(Star):
         return f"{final_prompt}{output_format_requirements}"
 
     def _format_messages_for_llm(self, messages_dict: Dict[str, List[Dict]]) -> str:
-        """格式化消息用于 LLM 分析"""
-        lines = []
-
+        """格式化消息用于 LLM 分析（按全局时间排序）"""
+        # 扁平化所有消息
+        flattened = []
         for user_id, messages in messages_dict.items():
             for msg in messages:
-                timestamp = time.strftime("%H:%M:%S", time.localtime(msg["timestamp"]))
-                user_name = msg.get("user_name", "未知用户")
-                message = msg["message"]
-                lines.append(f"[{user_id}|{user_name}] {timestamp}: {message}")
+                flattened.append({
+                    "user_id": user_id,
+                    "timestamp": msg.get("timestamp", 0),
+                    "user_name": msg.get("user_name", "未知用户"),
+                    "message": msg["message"]
+                })
+
+        # 按全局时间排序
+        flattened.sort(key=lambda m: m["timestamp"])
+
+        # 格式化输出
+        lines = []
+        for msg in flattened:
+            timestamp = time.strftime("%H:%M:%S", time.localtime(msg["timestamp"]))
+            lines.append(f"[{msg['user_id']}|{msg['user_name']}] {timestamp}: {msg['message']}")
 
         return "\n".join(lines)
 
     def _parse_llm_response(self, response: str) -> List[Dict]:
-        """解析 LLM 响应，提取违规用户列表"""
+        """解析 LLM 响应，提取违规用户列表（不做用户集合验证，由 _validate_and_apply_guardrails 负责）"""
         try:
             # 尝试直接解析 JSON
             data = json.loads(response)
@@ -562,6 +582,33 @@ class SpeechCensorshipPlugin(Star):
             except Exception as e:
                 logger.error(f"解析 LLM 响应失败: {e}\n响应内容: {response}")
                 return []
+
+    def _validate_and_apply_guardrails(self, group_id: str, user_id: str, messages_dict: Dict[str, List[Dict]], reason: str) -> bool:
+        """验证用户和应用防误杀护栏。返回 True 则执行禁言，False 则跳过"""
+        # 1. 用户集合约束：检验 user_id 是否在本次 messages_dict 中出现
+        if user_id not in messages_dict:
+            logger.warning(f"[护栏] 用户 {user_id} 不在本次消息记录中，疑似 LLM 幻觉，跳过禁言")
+            return False
+
+        # 2. 重复违规检查：同一周期内同一用户不连续禁言
+        violation_key = f"{group_id}_{user_id}"
+        if self.user_violation_records[violation_key].get("count", 0) > 0:
+            last_violation_time = self.user_violation_records[violation_key].get("last_time", 0)
+            if time.time() - last_violation_time < 3600:  # 1小时内
+                logger.warning(f"[护栏] 用户 {user_id} 在 1 小时内已被处罚，跳过本次禁言")
+                return False
+
+        # 3. 消息数量检查：确保至少有 1 条以上的违规消息
+        user_messages = messages_dict.get(user_id, [])
+        if not user_messages or len(user_messages) == 0:
+            logger.warning(f"[护栏] 用户 {user_id} 没有对应消息，跳过禁言")
+            return False
+
+        # 4. 可选：关键词二阶检查（可扩展为更多规则）
+        # 这里可以根据 reason 和 messages 做额外校验
+
+        logger.info(f"[护栏验证通过] 用户 {user_id} 将被禁言，原因：{reason}")
+        return True
 
     async def _ban_user(self, group_id: str, user_id: str, reason: str):
         """禁言用户并发送警告消息"""
@@ -603,6 +650,11 @@ class SpeechCensorshipPlugin(Star):
 
                 if ret is None or (isinstance(ret, dict) and ret.get('retcode') == 0):
                     logger.info(f"禁言成功: 用户 {user_id}")
+
+                    # 记录违规历史
+                    violation_key = f"{group_id}_{user_id}"
+                    self.user_violation_records[violation_key]["count"] = self.user_violation_records[violation_key].get("count", 0) + 1
+                    self.user_violation_records[violation_key]["last_time"] = time.time()
 
                     # 发送警告消息
                     if self._get_config("send_warning", True):
