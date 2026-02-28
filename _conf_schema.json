@@ -1,0 +1,75 @@
+{
+  "trigger_mode": {
+    "description": "检测触发模式",
+    "type": "string",
+    "options": ["time_only", "count_only", "hybrid", "strict_hybrid"],
+    "default": "hybrid",
+    "hint": "time_only: 仅定时触发 | count_only: 仅消息数量触发 | hybrid: 时间或数量任一达标触发 | strict_hybrid: 时间和数量都达标才触发（更省 token）"
+  },
+  "check_interval": {
+    "description": "检测时间间隔（秒）",
+    "type": "int",
+    "default": 60,
+    "hint": "每隔多少秒检测一次消息累积情况（适用于 time_only 和 hybrid 模式）"
+  },
+  "batch_size": {
+    "description": "触发检测的消息数量",
+    "type": "int",
+    "default": 10,
+    "hint": "累积多少条消息后触发检测（适用于 count_only 和 hybrid 模式）"
+  },
+  "recent_message_limit": {
+    "description": "严格混合模式最近消息窗口",
+    "type": "int",
+    "default": 50,
+    "hint": "仅 strict_hybrid 生效。只保留最近 N 条消息用于缓冲与送审；设为 0 表示不限制"
+  },
+  "ban_duration": {
+    "description": "禁言时长（秒）",
+    "type": "int",
+    "default": 600,
+    "hint": "检测到违规内容后的禁言时长，0 表示解除禁言"
+  },
+  "enabled_groups": {
+    "description": "启用的群组列表",
+    "type": "list",
+    "default": [],
+    "hint": "仅对这些群组生效（填写群号），留空则对所有群组生效"
+  },
+  "whitelist_users": {
+    "description": "白名单用户",
+    "type": "list",
+    "default": [],
+    "hint": "这些用户的消息不会被检测（填写 QQ 号）"
+  },
+  "llm_provider": {
+    "description": "LLM 提供商",
+    "type": "string",
+    "_special": "select_provider",
+    "hint": "选择用于内容审核的 LLM 提供商"
+  },
+  "default_review_rules": {
+    "description": "默认审核规则（预置提示词）",
+    "type": "text",
+    "default": "1. 阴阳怪气、讽刺挖苦、挑衅行为\n2. 争吵辱骂、人身攻击、恶意诋毁\n3. 敏感话题（政治、宗教、色情、暴力等）\n4. 恶意刷屏、广告骚扰",
+    "hint": "这是预先填好的默认规则，你可以直接修改。插件会自动与 custom_review_rules 拼接。"
+  },
+  "custom_review_rules": {
+    "description": "自定义违规规则（追加）",
+    "type": "text",
+    "default": "",
+    "hint": "仅填写你想额外禁止的内容，插件会自动与默认规则拼接，并固定JSON输出格式。示例：禁止地域黑、引战游戏话题、连续@他人骚扰。"
+  },
+  "send_warning": {
+    "description": "发送警告消息",
+    "type": "bool",
+    "default": true,
+    "hint": "禁言后是否在群内发送警告消息"
+  },
+  "warning_template": {
+    "description": "警告消息模板",
+    "type": "string",
+    "default": "⚠️ 用户 {user} 因 {reason} 已被禁言 {duration} 秒。请注意文明发言。",
+    "hint": "支持变量: {user}(用户ID), {reason}(违规原因), {duration}(禁言时长)"
+  }
+}

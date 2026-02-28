@@ -1,14 +1,257 @@
-# astrbot-plugin-helloworld
+# 群聊消息审核与自动禁言插件
 
-AstrBot 插件模板 / A template plugin for AstrBot plugin feature
+一个基于 LLM 的智能 QQ 群聊内容审核插件，自动识别并处理阴阳怪气、争吵、敏感话题等违规内容。
 
-> [!NOTE]
-> This repo is just a template of [AstrBot](https://github.com/AstrBotDevs/AstrBot) Plugin.
-> 
-> [AstrBot](https://github.com/AstrBotDevs/AstrBot) is an agentic assistant for both personal and group conversations. It can be deployed across dozens of mainstream instant messaging platforms, including QQ, Telegram, Feishu, DingTalk, Slack, LINE, Discord, Matrix, etc. In addition, it provides a reliable and extensible conversational AI infrastructure for individuals, developers, and teams. Whether you need a personal AI companion, an intelligent customer support agent, an automation assistant, or an enterprise knowledge base, AstrBot enables you to quickly build AI applications directly within your existing messaging workflows.
+## 功能特性
 
-# Supports
+- 🤖 **智能识别**：使用 LLM 分析群聊消息，识别阴阳怪气、争吵辱骂、敏感话题等违规内容
+- ⚡ **灵活触发**：支持三种检测模式（仅定时、仅消息数量、混合模式）
+- 🛡️ **自动禁言**：检测到违规内容后自动禁言用户并发送警告消息
+- 🎯 **精准控制**：支持群组白名单和用户白名单配置
+- 📊 **批量处理**：累积多条消息后批量分析，节省 LLM 调用成本
+- 🔧 **高度可配置**：通过 WebUI 可视化配置所有参数
 
-- [AstrBot Repo](https://github.com/AstrBotDevs/AstrBot)
-- [AstrBot Plugin Development Docs (Chinese)](https://docs.astrbot.app/dev/star/plugin-new.html)
-- [AstrBot Plugin Development Docs (English)](https://docs.astrbot.app/en/dev/star/plugin-new.html)
+## 安装方法
+
+1. 将插件文件放入 AstrBot 的插件目录：
+
+   ```
+   AstrBot/data/plugins/speech-censorship/
+   ```
+
+2. 重启 AstrBot 或在插件管理页面重载插件
+
+3. 在 WebUI 中配置插件参数
+
+## 快速测试
+
+安装插件后，可以使用测试命令验证禁言功能是否正常工作：
+
+**在群聊中发送：**
+
+```
+/test_ban
+```
+
+**效果：**
+
+- ✅ 发送者会被禁言 1 分钟
+- ✅ 群内会显示测试结果消息
+- ✅ 可以验证 Bot 是否有管理员权限
+
+**注意：**
+
+- 仅群聊可用
+- 仅 QQ 平台（aiocqhttp）支持
+- Bot 需要是群管理员或群主
+- 被禁言后发送者看不到回复消息（这是正常的）
+
+## 配置说明
+
+### 必需配置
+
+- **LLM 提供商**：选择用于内容审核的 LLM（需要先在 AstrBot 中配置 LLM）
+
+### 触发机制配置
+
+- **触发模式**：
+  - `time_only`：仅定时触发（每隔 N 秒检测一次）
+  - `count_only`：仅消息数量触发（累积 N 条消息后检测）
+  - `hybrid`：混合模式（时间或数量达标都触发，推荐）
+
+- **检测时间间隔**：定时触发的时间间隔（秒），默认 60 秒
+
+- **触发检测的消息数量**：累积多少条消息后触发检测，默认 10 条
+
+### 禁言策略配置
+
+- **禁言时长**：检测到违规内容后的禁言时长（秒），默认 600 秒（10 分钟）
+
+- **发送警告消息**：是否在禁言后发送警告消息到群聊，默认开启
+
+- **警告消息模板**：自定义警告消息，支持变量：
+  - `{user}`：违规用户的 QQ 号
+  - `{reason}`：违规原因
+  - `{duration}`：禁言时长
+
+### 过滤配置
+
+- **启用的群组列表**：仅对指定的群组生效（填写群号），留空则对所有群组生效
+
+- **白名单用户**：这些用户的消息不会被检测（填写 QQ 号）
+
+## 使用示例
+
+### 场景 1：活跃群组（推荐混合模式）
+
+```json
+{
+  "trigger_mode": "hybrid",
+  "check_interval": 60,
+  "batch_size": 10,
+  "ban_duration": 600
+}
+```
+
+- 每 60 秒检测一次，或累积 10 条消息就检测
+- 及时发现问题，避免冲突升级
+
+### 场景 2：低频群组（推荐仅消息数量）
+
+```json
+{
+  "trigger_mode": "count_only",
+  "batch_size": 20,
+  "ban_duration": 300
+}
+```
+
+- 累积 20 条消息后才检测
+- 节省 LLM 调用次数和成本
+
+### 场景 3：高频群组（推荐仅定时）
+
+```json
+{
+  "trigger_mode": "time_only",
+  "check_interval": 120,
+  "ban_duration": 900
+}
+```
+
+- 每 2 分钟定时检测一次
+- 避免频繁调用 LLM
+
+## 工作原理
+
+1. **消息监听**：插件监听所有 QQ 群聊消息（不含指令前缀）
+2. **消息累积**：将消息按群组和用户分类存储到缓冲区
+3. **触发检测**：根据配置的触发模式决定何时进行检测
+4. **LLM 分析**：批量发送消息给 LLM，识别违规内容和用户
+5. **执行禁言**：调用 NapCat API 对违规用户进行禁言
+6. **发送警告**：在群聊中发送警告消息（可选）
+
+## 权限要求
+
+- ✅ Bot 必须是群管理员或群主才能执行禁言操作
+- ✅ 需要配置 NapCat 适配器（或其他支持 aiocqhttp 协议的适配器）
+- ✅ 需要配置至少一个 LLM 提供商
+
+## 常见问题
+
+### Q: 为什么禁言失败？
+
+A: 请检查：
+
+1. Bot 是否为群管理员或群主
+2. 是否使用了 QQ 平台（aiocqhttp）
+3. 查看日志中的错误信息
+
+### Q: LLM 没有正确识别违规内容怎么办？
+
+A: 可能的原因：
+
+1. LLM 模型能力不足，建议使用更强大的模型
+2. 消息上下文不够，可以增加 `batch_size`
+3. 可以尝试修改 prompt（需修改代码）
+
+### Q: 如何避免误封？
+
+A: 建议：
+
+1. 将管理员添加到白名单
+2. 适当增加 `batch_size`，让 LLM 有更多上下文
+3. 首次使用时设置较短的禁言时长进行测试
+
+### Q: 插件会消耗多少 LLM Token？
+
+A: 消耗量取决于：
+
+- 触发频率（由 `trigger_mode`、`check_interval`、`batch_size` 决定）
+- 消息长度
+- 群组活跃度
+
+建议在活跃群组使用 `count_only` 或较大的 `check_interval` 以控制成本。
+
+## 开发与测试
+
+### 安装开发依赖
+
+```bash
+pip install -r requirements-dev.txt
+```
+
+### 运行单元测试
+
+```bash
+# 运行所有测试
+pytest test_main.py -v
+
+# 运行测试并显示覆盖率
+pytest test_main.py -v --cov=main --cov-report=term-missing
+
+# 生成 HTML 覆盖率报告
+pytest test_main.py --cov=main --cov-report=html
+```
+
+### 代码格式化
+
+使用 Ruff 格式化代码（遵循 AstrBot 规范）：
+
+```bash
+# 检查代码风格
+ruff check main.py
+
+# 自动修复问题
+ruff check main.py --fix
+
+# 格式化代码
+ruff format main.py
+```
+
+### 测试覆盖率
+
+当前测试覆盖了以下功能：
+
+- ✅ 插件初始化和配置加载
+- ✅ 消息监听和累积机制
+- ✅ 白名单过滤（用户和群组）
+- ✅ 三种触发模式逻辑
+- ✅ LLM 分析和响应解析
+- ✅ 禁言 API 调用
+- ✅ 旧消息清理机制
+- ✅ 插件卸载和资源清理
+- ✅ 错误处理和超时机制
+
+### 代码质量规范
+
+本插件遵循 AstrBot 插件开发规范：
+
+- ✅ 完善的单元测试
+- ✅ 良好的代码注释和文档
+- ✅ 数据存储在 `data` 目录（遵循规范）
+- ✅ 完善的错误处理机制
+- ✅ 使用 Ruff 进行代码格式化
+- ✅ 使用异步库（asyncio）进行网络请求
+- ✅ 类型提示和类型安全
+
+## 技术支持
+
+- [AstrBot 文档](https://docs.astrbot.app)
+- [NapCat API 文档](https://napcat.apifox.cn)
+- [插件开发指南](https://docs.astrbot.app/dev/star/plugin-new.html)
+
+## 许可证
+
+本插件基于 AstrBot 插件模板开发，遵循相同的开源许可证。
+
+## 更新日志
+
+### v1.0.0 (2026-02-28)
+
+- 🎉 初始版本发布
+- ✨ 支持三种触发模式
+- ✨ 集成 AstrBot LLM 系统
+- ✨ 自动禁言和警告消息
+- ✨ 群组和用户白名单
+- ✨ 完善的配置系统

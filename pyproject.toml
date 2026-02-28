@@ -1,0 +1,51 @@
+[tool.pytest.ini_options]
+# pytest 配置
+minversion = "7.0"
+testpaths = ["."]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+
+# 显示详细信息
+addopts = [
+    "-v",
+    "--tb=short",
+    "--strict-markers",
+    "--cov=main",
+    "--cov-report=term-missing",
+    "--cov-report=html",
+]
+
+# 标记
+markers = [
+    "asyncio: mark test as async",
+    "slow: mark test as slow",
+    "integration: mark test as integration test",
+]
+
+[tool.ruff]
+# Ruff 配置
+line-length = 120
+target-version = "py38"
+
+[tool.ruff.lint]
+select = [
+    "E", # pycodestyle errors
+    "W", # pycodestyle warnings
+    "F", # pyflakes
+    "I", # isort
+    "C", # flake8-comprehensions
+    "B", # flake8-bugbear
+]
+ignore = [
+    "E501", # line too long (handled by formatter)
+    "B008", # do not perform function calls in argument defaults
+    "C901", # too complex
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
