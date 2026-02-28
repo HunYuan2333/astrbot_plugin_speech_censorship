@@ -1,4 +1,5 @@
-name: speech-censorship
-desc: 群聊消息审核与自动禁言插件
+name: astrbot_plugin_speech_censorship
+desc: 一个基于 LLM 的智能 QQ 群聊内容审核插件，自动识别并处理阴阳怪气、争吵、敏感话题等违规内容。
 version: 1.0.7
-author: YourName
+author: HunYuan2333
+repo: https://github.com/HunYuan2333/astrbot_plugin_speech_censorship
