@@ -23,10 +23,10 @@ from .ban_executor import BanExecutor
 
 class SpeechCensorshipPlugin(Star):
     """群聊消息审核与自动禁言插件
-
+    
     架构：
     - MessageBuffer: 消息缓冲管理
-    - LLMAnalyzer: LLM 分析和响应解析
+    - LLMAnalyzer: LLM 分析和响应解析  
     - ViolationManager: 违规记录持久化
     - BanExecutor: 禁言执行和警告
     - SpeechCensorshipPlugin: 事件处理和业务协调
@@ -128,10 +128,7 @@ class SpeechCensorshipPlugin(Star):
         llm_provider = self._get_config("llm_provider", "")
 
         total_groups = len(self.message_buffer.buffer)
-        total_messages = sum(
-            sum(len(msgs) for msgs in users.values())
-            for users in self.message_buffer.buffer.values()
-        ) if total_groups > 0 else 0
+        total_messages = self.message_buffer.get_total_messages(total_groups) if total_groups > 0 else 0
 
         stats = self.violation_manager.get_stats() if self.violation_manager else {}
 
@@ -158,7 +155,7 @@ class SpeechCensorshipPlugin(Star):
             "- 审核提示词由插件固定生成（含默认规则 + 你的自定义规则）\n"
             f"- default_review_rules: {'已配置' if default_rules.strip() else '未配置'}\n"
             f"- custom_review_rules: {'已配置' if custom_rules.strip() else '未配置'}\n"
-            '- 你只需要填写"额外禁止什么"，不需要写提示词模板\n'
+            "- 你只需要填写"额外禁止什么"，不需要写提示词模板\n"
             "- 你不需要写 JSON 返回格式，插件会自动附加\n"
             "- LLM 必须严格返回 JSON，不要返回额外文字\n"
             f"- JSON 格式: {self.REQUIRED_JSON_FORMAT}"
