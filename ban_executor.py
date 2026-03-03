@@ -151,7 +151,7 @@ class BanExecutor:
 
         # 2. 消息数量检查：确保至少有 1 条以上的违规消息
         user_messages = messages_dict.get(user_id, [])
-        if not user_messages or len(user_messages) == 0:
+        if not user_messages:
             logger.warning(f"[护栏] 用户 {user_id} 没有对应消息，跳过禁言")
             return False
 

@@ -136,18 +136,21 @@ class LLMAnalyzer:
 
     def parse_llm_response(self, response: str) -> List[Dict]:
         """解析 LLM 响应，提取违规用户列表（严格Schema验证）"""
-        try:
-            # 尝试直接解析 JSON
-            json_str = response
-        except:
-            # 如果不是完整的 JSON，尝试提取 JSON 部分
-            json_str = self._extract_json_string(response)
+        if not isinstance(response, str) or not response.strip():
+            logger.error("LLM响应为空或类型错误，无法解析")
+            return []
 
         try:
-            data = json.loads(json_str)
+            # 优先尝试直接解析 JSON
+            data = json.loads(response)
         except json.JSONDecodeError as e:
-            logger.error(f"无法解析LLM响应为JSON: {e}")
-            return []
+            # 如果失败，尝试提取 Markdown 代码块或正文中的 JSON
+            try:
+                json_str = self._extract_json_string(response)
+                data = json.loads(json_str)
+            except (ValueError, json.JSONDecodeError) as nested_error:
+                logger.error(f"无法解析LLM响应为JSON: {nested_error}")
+                return []
 
         # 提取and验证violations字段
         violations = data.get("violations", [])

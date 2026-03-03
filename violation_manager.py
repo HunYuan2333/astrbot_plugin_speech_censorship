@@ -5,7 +5,7 @@ import json
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from astrbot.api import logger
 
@@ -30,7 +30,7 @@ class ViolationManager:
         # 用户违规记录
         # 结构: {group_id: {user_id: {"count": int, "last_time": float, "created_time": float}}}
         # 嵌套结构更直观，避免键冲突问题
-        self.records: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(dict)
+        self.records: Dict[str, Dict[str, Dict[str, Any]]] = defaultdict(dict)
 
     @property
     def records_file(self) -> Path:
@@ -41,20 +41,18 @@ class ViolationManager:
         """从文件中加载违规记录"""
         try:
             if self.records_file.exists():
-                with open(self.records_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    # 支持两种格式：新的嵌套结构和旧的扁平结构（向后兼容）
-                    if isinstance(data, dict):
-                        # 尝试检测是否为旧格式（flat key like "group_user"）
-                        first_key = next(iter(data.keys())) if data else ""
-                        if first_key and "_" in first_key and not isinstance(data.get(first_key), dict):
-                            # 旧格式：扁平结构，需要转换
-                            logger.info("检测到旧格式违规记录，正在迁移...")
-                            self.records = self._migrate_flat_records(data)
-                        else:
-                            # 新格式：嵌套结构
-                            self.records = defaultdict(dict, data)
-                    logger.info(f"已加载违规记录")
+                data = await asyncio.to_thread(self._read_records_file)
+
+                # 支持两种格式：新的嵌套结构和旧的扁平结构（向后兼容）
+                if isinstance(data, dict):
+                    if self._looks_like_flat_records(data):
+                        logger.info("检测到旧格式违规记录，正在迁移...")
+                        migrated = self._migrate_flat_records(data)
+                        self.records = self._normalize_nested_records(migrated)
+                    else:
+                        self.records = self._normalize_nested_records(data)
+
+                logger.info("已加载违规记录")
             else:
                 logger.debug("未找到违规记录文件，使用空记录")
         except Exception as e:
@@ -74,11 +72,56 @@ class ViolationManager:
                         "created_time": float(record.get("created_time", 0))
                     }
 
-            with open(self.records_file, 'w', encoding='utf-8') as f:
-                json.dump(serializable_records, f, ensure_ascii=False, indent=2)
+            await asyncio.to_thread(self._write_records_file, serializable_records)
             logger.debug("已保存违规记录")
         except Exception as e:
             logger.error(f"保存违规记录失败: {e}", exc_info=True)
+
+    def _read_records_file(self) -> dict:
+        """同步读取记录文件（供 to_thread 调用）"""
+        with open(self.records_file, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+    def _write_records_file(self, records: Dict[str, Dict[str, Dict[str, float]]]):
+        """同步写入记录文件（供 to_thread 调用）"""
+        with open(self.records_file, 'w', encoding='utf-8') as f:
+            json.dump(records, f, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def _looks_like_flat_records(data: Dict[str, Any]) -> bool:
+        """判断是否为旧版扁平结构：{group_user: {count,...}}"""
+        if not data:
+            return False
+
+        flat_like = 0
+        for key, value in data.items():
+            if not isinstance(key, str) or not isinstance(value, dict):
+                continue
+            if "_" in key and ("count" in value or "last_time" in value or "created_time" in value):
+                flat_like += 1
+
+        return flat_like > 0 and flat_like == len(data)
+
+    @staticmethod
+    def _normalize_nested_records(data: Dict[str, Any]) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        """标准化嵌套结构，确保 records 外层/中层类型一致"""
+        normalized: Dict[str, Dict[str, Dict[str, Any]]] = defaultdict(dict)
+
+        for group_id, users in data.items():
+            if not isinstance(group_id, str) or not isinstance(users, dict):
+                continue
+
+            for user_id, record in users.items():
+                if not isinstance(user_id, str) or not isinstance(record, dict):
+                    continue
+
+                normalized[group_id][user_id] = {
+                    "count": int(record.get("count", 0)),
+                    "last_time": float(record.get("last_time", 0)),
+                    "created_time": float(record.get("created_time", 0)),
+                }
+
+        return normalized
 
     @staticmethod
     def _migrate_flat_records(flat_records: Dict[str, Dict]) -> Dict[str, Dict[str, Dict]]:

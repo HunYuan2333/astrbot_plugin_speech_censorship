@@ -62,6 +62,7 @@ class SpeechCensorshipPlugin(Star):
 
         # 保存最新的 event 对象（用于发送消息和调用 API）
         self.latest_events: Dict[str, AstrMessageEvent] = {}
+        self.latest_event_timestamps: Dict[str, float] = {}
 
         # 缓存的导入（用于防止平台耦合）
         self._aiocqhttp_event_class = None
@@ -98,6 +99,11 @@ class SpeechCensorshipPlugin(Star):
             logger.error(f"获取数据目录失败: {e}")
             # 在极端情况下，仍然抛出异常而不是降级，以防止配置隐式失败
             raise
+
+    def _touch_latest_event(self, group_id: str, event: AstrMessageEvent):
+        """更新群组最近事件引用及时间戳"""
+        self.latest_events[group_id] = event
+        self.latest_event_timestamps[group_id] = time.time()
 
     async def initialize(self):
         """插件初始化：加载配置、启动定时任务"""
@@ -182,7 +188,7 @@ class SpeechCensorshipPlugin(Star):
                 return
 
             # 刷新该群最近事件引用
-            self.latest_events[group_id] = event
+            self._touch_latest_event(group_id, event)
 
             total_messages = self.message_buffer.get_total_messages(group_id)
             if total_messages == 0:
@@ -231,43 +237,50 @@ class SpeechCensorshipPlugin(Star):
             logger.info(f"执行测试禁言：群 {group_id}，用户 {user_id}（{user_name}），时长 {test_duration} 秒")
 
             try:
-                try:
-                    group_id_int = int(group_id)
-                    user_id_int = int(user_id)
-                except ValueError as ve:
-                    logger.error(f"类型转换失败 - group_id={group_id}, user_id={user_id}: {ve}")
-                    yield event.plain_result(
-                        f"❌ 参数错误：无法将群ID或用户ID转换为整数\n"
-                        f"group_id={group_id}, user_id={user_id}"
-                    )
-                    return
+                group_id_int = int(group_id)
+                user_id_int = int(user_id)
+            except ValueError as ve:
+                logger.error(f"类型转换失败 - group_id={group_id}, user_id={user_id}: {ve}")
+                yield event.plain_result(
+                    f"❌ 参数错误：无法将群ID或用户ID转换为整数\n"
+                    f"group_id={group_id}, user_id={user_id}"
+                )
+                return
 
+            try:
                 ret = await client.api.call_action(
                     'set_group_ban',
                     group_id=group_id_int,
                     user_id=user_id_int,
                     duration=test_duration
                 )
-
-                if ret is None or (isinstance(ret, dict) and ret.get('retcode') == 0):
-                    logger.info(f"测试禁言成功：用户 {user_id}")
-                    yield event.plain_result(
-                        f"✅ 测试成功！用户 {user_name}（{user_id}）已被禁言 {test_duration} 秒。\n"
-                        f"这是一次测试，用于验证禁言功能是否正常工作。"
-                    )
-                else:
-                    error_msg = ret.get('message', '未知错误') if isinstance(ret, dict) else f"未知返回: {ret}"
-                    logger.error(f"测试禁言失败: {ret}")
-                    yield event.plain_result(
-                        f"❌ 禁言失败：{error_msg}\n"
-                        f"可能原因：Bot 不是管理员、权限不足、或 API 调用失败。"
-                    )
-
+            except TypeError as te:
+                logger.error(f"调用禁言 API 参数错误: {te}", exc_info=True)
+                yield event.plain_result(
+                    f"❌ API 参数错误：{te}\n"
+                    f"请检查 Bot 配置和参数类型。"
+                )
+                return
             except Exception as e:
                 logger.error(f"调用禁言 API 失败: {e}", exc_info=True)
                 yield event.plain_result(
                     f"❌ API 调用异常：{str(e)}\n"
                     f"请检查 Bot 配置和权限。"
+                )
+                return
+
+            if ret is None or (isinstance(ret, dict) and ret.get('retcode') == 0):
+                logger.info(f"测试禁言成功：用户 {user_id}")
+                yield event.plain_result(
+                    f"✅ 测试成功！用户 {user_name}（{user_id}）已被禁言 {test_duration} 秒。\n"
+                    f"这是一次测试，用于验证禁言功能是否正常工作。"
+                )
+            else:
+                error_msg = ret.get('message', '未知错误') if isinstance(ret, dict) else f"未知返回: {ret}"
+                logger.error(f"测试禁言失败: {ret}")
+                yield event.plain_result(
+                    f"❌ 禁言失败：{error_msg}\n"
+                    f"可能原因：Bot 不是管理员、权限不足、或 API 调用失败。"
                 )
 
         except Exception as e:
@@ -295,7 +308,7 @@ class SpeechCensorshipPlugin(Star):
                 return
 
             # 保存最新的 event 对象
-            self.latest_events[group_id] = event
+            self._touch_latest_event(group_id, event)
 
             # 不缓冲机器人自身消息
             if self_id and user_id == self_id:
@@ -414,11 +427,23 @@ class SpeechCensorshipPlugin(Star):
 
     def _cleanup_stale_events(self):
         """清理不再活跃的群组的event缓存"""
-        active_groups = set(self.message_buffer.buffer.keys())
-        stale_groups = [gid for gid in self.latest_events.keys() if gid not in active_groups]
+        active_groups = {
+            group_id
+            for group_id in self.message_buffer.buffer.keys()
+            if self.message_buffer.get_total_messages(group_id) > 0
+        }
+        current_time = time.time()
+        max_event_age_seconds = self._get_config("event_cache_max_age", 1800)
+
+        stale_groups = [
+            gid for gid in list(self.latest_events.keys())
+            if (gid not in active_groups)
+            or (current_time - self.latest_event_timestamps.get(gid, 0) > max_event_age_seconds)
+        ]
 
         for group_id in stale_groups:
             del self.latest_events[group_id]
+            self.latest_event_timestamps.pop(group_id, None)
 
         if stale_groups:
             logger.debug(f"清理了 {len(stale_groups)} 个不活跃群组的event缓存")
