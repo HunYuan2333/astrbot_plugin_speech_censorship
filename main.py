@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star
+from astrbot.api.star import Context, Star, StarTools
 
 from .message_buffer import MessageBuffer
 from .llm_analyzer import LLMAnalyzer
@@ -86,16 +86,18 @@ class SpeechCensorshipPlugin(Star):
             return None
 
     def _get_data_dir(self) -> Path:
-        """获取数据保存目录（使用 AstrBot 的标准数据目录）"""
+        """获取数据保存目录（使用 AstrBot 的标准数据目录）
+
+        必须遵循 AstrBot 框架标准：data/plugin_data/<plugin_name>
+        """
         try:
-            from astrbot.api import StarTools
+            # 根据 AstrBot 框架规范，使用 StarTools.get_data_dir()
             data_dir = StarTools.get_data_dir()
-            return Path(data_dir) / "speech_censorship"
-        except (ImportError, AttributeError):
-            # 降级：使用本地数据目录
-            data_dir = Path(__file__).parent / ".data"
-            data_dir.mkdir(exist_ok=True)
-            return data_dir
+            return Path(data_dir)
+        except Exception as e:
+            logger.error(f"获取数据目录失败: {e}")
+            # 在极端情况下，仍然抛出异常而不是降级，以防止配置隐式失败
+            raise
 
     async def initialize(self):
         """插件初始化：加载配置、启动定时任务"""
@@ -395,11 +397,14 @@ class SpeechCensorshipPlugin(Star):
                                 await self._process_group_messages(group_id)
 
                 # 清理过期消息（超过 1 小时）
-                await self.message_buffer.cleanup_old_messages()
+                self.message_buffer.cleanup_old_messages()
 
                 # 清理过期违规记录
                 if self.violation_manager:
                     await self.violation_manager.cleanup_expired_records()
+
+                # 清理已清空的群组的event缓存（防止内存泄漏）
+                self._cleanup_stale_events()
 
             except asyncio.CancelledError:
                 logger.info("定时检测任务被取消")
@@ -407,38 +412,65 @@ class SpeechCensorshipPlugin(Star):
             except Exception as e:
                 logger.error(f"定时检测出错: {e}", exc_info=True)
 
+    def _cleanup_stale_events(self):
+        """清理不再活跃的群组的event缓存"""
+        active_groups = set(self.message_buffer.buffer.keys())
+        stale_groups = [gid for gid in self.latest_events.keys() if gid not in active_groups]
+
+        for group_id in stale_groups:
+            del self.latest_events[group_id]
+
+        if stale_groups:
+            logger.debug(f"清理了 {len(stale_groups)} 个不活跃群组的event缓存")
+
     async def _process_group_messages(self, group_id: str):
-        """处理群组的累积消息（修复竞态条件）"""
+        """处理群组的累积消息（修复竞态条件和防止消息丢失）"""
         lock = self.message_buffer.get_or_create_lock(group_id)
 
-        # 第1阶段：在锁保护下，弹出并重置缓冲区
+        # 第1阶段：在锁保护下，创建消息快照（不清除）
         async with lock:
             try:
-                # 原子操作：创建快照并清空缓冲区
-                messages_dict = self.message_buffer.snapshot_and_clear(group_id)
+                # 创建快照但不清空缓冲区（防止LLM失败时消息丢失）
+                messages_dict = dict(self.message_buffer.buffer.get(group_id, {}))
 
                 if not messages_dict:
                     return
 
                 total_count = sum(len(msgs) for msgs in messages_dict.values())
+                logger.info(f"群 {group_id} 获取消息快照（{total_count} 条），即将进行 LLM 分析...")
 
                 # 更新检测时间
                 self.message_buffer.update_check_time(group_id)
-
-                logger.info(f"群 {group_id} 消息缓冲已原子提取且重置（{total_count} 条），即将进行 LLM 分析...")
             except Exception as e:
-                logger.error(f"缓冲区提取失败: {e}", exc_info=True)
+                logger.error(f"缓冲区快照获取失败: {e}", exc_info=True)
                 return
 
-        # 第2阶段：释放锁后进行耗时操作
+        # 第2阶段：释放锁后进行耗时的LLM分析
         try:
             llm_provider = self._get_config("llm_provider", "")
+            if not llm_provider:
+                logger.warning(f"群 {group_id} 未配置 LLM 提供商，跳过分析")
+                return
+
             default_rules = self._get_config("default_review_rules", "")
             custom_rules = self._get_config("custom_review_rules", "")
 
             violations = await self.llm_analyzer.analyze_messages(
                 group_id, messages_dict, llm_provider, default_rules, custom_rules
             )
+
+            # 第3阶段：LLM分析成功后，在锁保护下清除已处理消息
+            async with lock:
+                try:
+                    # 应用recent_message_limit限制
+                    recent_message_limit = self._get_config("recent_message_limit", 0)
+                    if recent_message_limit > 0:
+                        self.message_buffer.trim_recent_messages(group_id, recent_message_limit)
+
+                    # LLM分析成功，清空该批消息
+                    self.message_buffer.snapshot_and_clear(group_id)
+                except Exception as e:
+                    logger.error(f"清空缓冲区失败: {e}", exc_info=True)
 
             if violations:
                 logger.info(f"检测到 {len(violations)} 个违规用户")
@@ -474,7 +506,7 @@ class SpeechCensorshipPlugin(Star):
                 logger.info(f"群 {group_id} 未检测到违规内容")
 
         except Exception as e:
-            logger.error(f"处理群组消息时出错: {e}", exc_info=True)
+            logger.error(f"LLM分析或后续处理失败: {e}，消息保留在缓冲区供重试", exc_info=True)
 
     async def terminate(self):
         """插件卸载时取消定时任务并保存数据"""

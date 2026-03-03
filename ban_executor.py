@@ -36,74 +36,73 @@ class BanExecutor:
         Returns:
             True 表示禁言成功，False 表示失败
         """
+        # 检查基本参数
+        if not event:
+            logger.warning(f"无法获取群 {group_id} 的 event 对象")
+            return False
+
+        if event.get_platform_name() != "aiocqhttp":
+            logger.warning("仅支持 QQ 平台（aiocqhttp）")
+            return False
+
+        # 获取并验证 AiocqhttpMessageEvent 类（必须成功，否则不能继续）
+        AiocqhttpMessageEvent = self.get_aiocqhttp_event_class()
+        if AiocqhttpMessageEvent is None:
+            logger.error(f"无法加载 AiocqhttpMessageEvent 类，禁言无法执行")
+            return False
+
+        if not isinstance(event, AiocqhttpMessageEvent):
+            logger.error("Event 类型验证失败，不是有效的 AiocqhttpMessageEvent 实例")
+            return False
+
+        # 获取 bot 客户端
+        client = event.bot
+        if not client:
+            logger.error("无法获取 bot 客户端对象")
+            return False
+
+        # 获取禁言时长
+        ban_duration = self.get_config("ban_duration", 600)
+
+        # 参数类型转换（必须成功）
         try:
-            # 检查 event 对象
-            if not event:
-                logger.warning(f"无法获取群 {group_id} 的 event 对象")
+            group_id_int = int(group_id)
+            user_id_int = int(user_id)
+        except ValueError as ve:
+            logger.error(f"禁言参数类型转换失败 - group_id={group_id}, user_id={user_id}: {ve}")
+            return False
+
+        logger.info(f"禁言用户 {user_id}（群: {group_id}，原因: {reason}，时长: {ban_duration} 秒）")
+
+        # 调用禁言 API（明确的单层异常捕获）
+        try:
+            ret = await client.api.call_action(
+                'set_group_ban',
+                group_id=group_id_int,
+                user_id=user_id_int,
+                duration=ban_duration
+            )
+
+            # 检查禁言是否成功
+            if ret is None or (isinstance(ret, dict) and ret.get('retcode') == 0):
+                logger.info(f"禁言成功: 用户 {user_id}")
+
+                # 发送警告消息
+                if self.get_config("send_warning", True):
+                    await self.send_warning_message(event, group_id, user_id, reason, ban_duration)
+
+                return True
+            else:
+                logger.error(f"禁言失败: {ret}")
                 return False
 
-            # 确保是 aiocqhttp 平台
-            if event.get_platform_name() != "aiocqhttp":
-                logger.warning("仅支持 QQ 平台（aiocqhttp）")
-                return False
-
-            # 验证 Event 类型（延迟加载）
-            AiocqhttpMessageEvent = self.get_aiocqhttp_event_class()
-            if AiocqhttpMessageEvent and not isinstance(event, AiocqhttpMessageEvent):
-                logger.warning("Event 类型不匹配")
-                return False
-
-            # 获取 bot 客户端
-            client = event.bot
-            if not client:
-                logger.warning("无法获取 bot 对象")
-                return False
-
-            # 获取禁言时长
-            ban_duration = self.get_config("ban_duration", 600)
-
-            # 安全的类型转换
-            try:
-                group_id_int = int(group_id)
-                user_id_int = int(user_id)
-            except ValueError as ve:
-                logger.error(f"禁言参数类型转换失败 - group_id={group_id}, user_id={user_id}: {ve}")
-                return False
-
-            # 调用禁言 API
-            logger.info(f"禁言用户 {user_id}（群: {group_id}，原因: {reason}，时长: {ban_duration} 秒）")
-
-            try:
-                ret = await client.api.call_action(
-                    'set_group_ban',
-                    group_id=group_id_int,
-                    user_id=user_id_int,
-                    duration=ban_duration
-                )
-
-                # 检查禁言是否成功
-                if ret is None or (isinstance(ret, dict) and ret.get('retcode') == 0):
-                    logger.info(f"禁言成功: 用户 {user_id}")
-
-                    # 发送警告消息
-                    if self.get_config("send_warning", True):
-                        await self.send_warning_message(event, group_id, user_id, reason, ban_duration)
-
-                    return True
-                else:
-                    logger.error(f"禁言失败: {ret}")
-                    return False
-
-            except ValueError as ve:
-                # 捕捉 API 调用中可能的类型转换错误
-                logger.error(f"禁言 API 调用失败（类型错误）: {ve}")
-                return False
-            except Exception as e:
-                logger.error(f"调用禁言 API 失败: {e}", exc_info=True)
-                return False
-
+        except TypeError as te:
+            # 处理参数类型相关错误
+            logger.error(f"API 调用参数错误: {te}")
+            return False
         except Exception as e:
-            logger.error(f"禁言用户时出错: {e}", exc_info=True)
+            # 处理其他API调用异常
+            logger.error(f"调用禁言 API 失败: {type(e).__name__}: {e}")
             return False
 
     async def send_warning_message(self, event: AstrMessageEvent, group_id: str,

@@ -28,8 +28,9 @@ class ViolationManager:
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
         # 用户违规记录
-        # 结构: {group_id_user_id: {"count": int, "last_time": float, "created_time": float}}
-        self.records: Dict[str, Dict[str, float]] = defaultdict(dict)
+        # 结构: {group_id: {user_id: {"count": int, "last_time": float, "created_time": float}}}
+        # 嵌套结构更直观，避免键冲突问题
+        self.records: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(dict)
 
     @property
     def records_file(self) -> Path:
@@ -42,8 +43,18 @@ class ViolationManager:
             if self.records_file.exists():
                 with open(self.records_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    self.records = defaultdict(dict, data)
-                    logger.info(f"已加载 {len(self.records)} 条违规记录")
+                    # 支持两种格式：新的嵌套结构和旧的扁平结构（向后兼容）
+                    if isinstance(data, dict):
+                        # 尝试检测是否为旧格式（flat key like "group_user"）
+                        first_key = next(iter(data.keys())) if data else ""
+                        if first_key and "_" in first_key and not isinstance(data.get(first_key), dict):
+                            # 旧格式：扁平结构，需要转换
+                            logger.info("检测到旧格式违规记录，正在迁移...")
+                            self.records = self._migrate_flat_records(data)
+                        else:
+                            # 新格式：嵌套结构
+                            self.records = defaultdict(dict, data)
+                    logger.info(f"已加载违规记录")
             else:
                 logger.debug("未找到违规记录文件，使用空记录")
         except Exception as e:
@@ -52,16 +63,38 @@ class ViolationManager:
     async def save_records(self):
         """将违规记录保存到文件"""
         try:
+            # 转换为可序列化的格式
+            serializable_records = {}
+            for group_id, users in self.records.items():
+                serializable_records[group_id] = {}
+                for user_id, record in users.items():
+                    serializable_records[group_id][user_id] = {
+                        "count": int(record.get("count", 0)),
+                        "last_time": float(record.get("last_time", 0)),
+                        "created_time": float(record.get("created_time", 0))
+                    }
+
             with open(self.records_file, 'w', encoding='utf-8') as f:
-                json.dump(dict(self.records), f, ensure_ascii=False, indent=2)
-            logger.debug(f"已保存 {len(self.records)} 条违规记录")
+                json.dump(serializable_records, f, ensure_ascii=False, indent=2)
+            logger.debug("已保存违规记录")
         except Exception as e:
             logger.error(f"保存违规记录失败: {e}", exc_info=True)
 
+    @staticmethod
+    def _migrate_flat_records(flat_records: Dict[str, Dict]) -> Dict[str, Dict[str, Dict]]:
+        """从扁平格式迁移到嵌套格式的违规记录"""
+        nested = defaultdict(dict)
+        for key, record in flat_records.items():
+            if "_" in key:
+                parts = key.rsplit("_", 1)
+                if len(parts) == 2:
+                    group_id, user_id = parts
+                    nested[group_id][user_id] = record
+        return nested
+
     def record_violation(self, group_id: str, user_id: str) -> dict:
         """记录一次违规行为"""
-        violation_key = f"{group_id}_{user_id}"
-        record = self.records[violation_key]
+        record = self.records[group_id].get(user_id, {})
 
         # 更新违规次数和最后违规时间
         record["count"] = record.get("count", 0) + 1
@@ -71,13 +104,12 @@ class ViolationManager:
         if "created_time" not in record:
             record["created_time"] = time.time()
 
-        self.records[violation_key] = record
+        self.records[group_id][user_id] = record
         return record
 
     def get_violation_record(self, group_id: str, user_id: str) -> Optional[dict]:
         """获取用户的违规记录"""
-        violation_key = f"{group_id}_{user_id}"
-        return self.records.get(violation_key)
+        return self.records.get(group_id, {}).get(user_id)
 
     def check_repeated_violation(self, group_id: str, user_id: str,
                                 cooldown_seconds: int = 3600) -> bool:
@@ -112,17 +144,21 @@ class ViolationManager:
         current_time = time.time()
         max_age_seconds = max_age_days * 24 * 3600
 
-        expired_keys = []
-        for key, record in self.records.items():
-            created_time = record.get("created_time", 0)
-            if created_time < (current_time - max_age_seconds):
-                expired_keys.append(key)
+        expired_count = 0
+        for group_id in list(self.records.keys()):
+            for user_id in list(self.records[group_id].keys()):
+                record = self.records[group_id][user_id]
+                created_time = record.get("created_time", 0)
+                if created_time < (current_time - max_age_seconds):
+                    del self.records[group_id][user_id]
+                    expired_count += 1
 
-        for key in expired_keys:
-            del self.records[key]
+            # 清理空的群组
+            if not self.records[group_id]:
+                del self.records[group_id]
 
-        if expired_keys:
-            logger.info(f"清理了 {len(expired_keys)} 条过期的违规记录")
+        if expired_count > 0:
+            logger.info(f"清理了 {expired_count} 条过期的违规记录")
             await self.save_records()
 
     def get_user_violation_count(self, group_id: str, user_id: str) -> int:
@@ -132,8 +168,12 @@ class ViolationManager:
 
     def get_stats(self) -> dict:
         """获取违规统计信息"""
-        total_records = len(self.records)
-        total_violations = sum(r.get("count", 0) for r in self.records.values())
+        total_records = sum(len(users) for users in self.records.values())
+        total_violations = sum(
+            record.get("count", 0)
+            for users in self.records.values()
+            for record in users.values()
+        )
 
         return {
             "total_records": total_records,

@@ -59,16 +59,25 @@ class LLMAnalyzer:
         return f"{final_prompt}{output_format_requirements}"
 
     def format_messages_for_llm(self, messages_dict: Dict[str, List[Dict]]) -> str:
-        """格式化消息用于 LLM 分析（按全局时间排序）"""
+        """格式化消息用于 LLM 分析（按全局时间排序）
+
+        对消息结构的字段进行容错处理，防止KeyError导致整批分析失败。
+        """
         # 扁平化所有消息
         flattened = []
         for user_id, messages in messages_dict.items():
             for msg in messages:
+                # 容错处理：获取必要字段，不存在则使用默认值
+                message_text = msg.get("message", "")
+                if not message_text or not isinstance(message_text, str):
+                    logger.warning(f"用户 {user_id} 的消息字段格式异常，将跳过: {msg}")
+                    continue
+
                 flattened.append({
                     "user_id": user_id,
                     "timestamp": msg.get("timestamp", 0),
                     "user_name": msg.get("user_name", "未知用户"),
-                    "message": msg["message"]
+                    "message": message_text
                 })
 
         # 按全局时间排序
@@ -110,7 +119,8 @@ class LLMAnalyzer:
 
             result = llm_resp.completion_text if llm_resp else ""
 
-            logger.debug(f"LLM 响应: {result}")
+            # 仅记录响应长度以避免敏感内容泄露
+            logger.info(f"LLM 响应已收到 (长度: {len(result)} 字符)")
 
             # 解析 JSON 响应
             violations = self.parse_llm_response(result)
@@ -125,49 +135,54 @@ class LLMAnalyzer:
             return []
 
     def parse_llm_response(self, response: str) -> List[Dict]:
-        """解析 LLM 响应，提取违规用户列表（包含 Schema 验证）"""
+        """解析 LLM 响应，提取违规用户列表（严格Schema验证）"""
         try:
             # 尝试直接解析 JSON
-            data = json.loads(response)
-            violations = data.get("violations", [])
-
-            # Schema 验证：确保 violations 是列表
-            if not isinstance(violations, list):
-                logger.error(f"Schema 校验失败：violations 应为列表，实际类型: {type(violations).__name__}")
-                return []
-
-            # 验证每个元素都有必要字段
-            valid_violations = []
-            for v in violations:
-                if isinstance(v, dict) and "user_id" in v:
-                    valid_violations.append(v)
-                else:
-                    logger.warning(f"违规项目格式不正确，跳过: {v}")
-
-            return valid_violations
-        except json.JSONDecodeError:
+            json_str = response
+        except:
             # 如果不是完整的 JSON，尝试提取 JSON 部分
-            try:
-                json_str = self._extract_json_string(response)
-                data = json.loads(json_str)
-                violations = data.get("violations", [])
+            json_str = self._extract_json_string(response)
 
-                # Schema 验证
-                if not isinstance(violations, list):
-                    logger.error(f"Schema 校验失败：violations 应为列表，实际类型: {type(violations).__name__}")
-                    return []
+        try:
+            data = json.loads(json_str)
+        except json.JSONDecodeError as e:
+            logger.error(f"无法解析LLM响应为JSON: {e}")
+            return []
 
-                valid_violations = []
-                for v in violations:
-                    if isinstance(v, dict) and "user_id" in v:
-                        valid_violations.append(v)
-                    else:
-                        logger.warning(f"违规项目格式不正确，跳过: {v}")
+        # 提取and验证violations字段
+        violations = data.get("violations", [])
 
-                return valid_violations
-            except Exception as e:
-                logger.error(f"解析 LLM 响应失败: {e}\n响应内容: {response}")
-                return []
+        # 类型验证：violations必须是列表
+        if not isinstance(violations, list):
+            logger.error(f"Schema验证失败：violations不是列表，实际类型: {type(violations).__name__}")
+            return []
+
+        # 严格Schema验证：每个违规项必须有有效的user_id和reason
+        valid_violations = []
+        for idx, v in enumerate(violations):
+            if not isinstance(v, dict):
+                logger.warning(f"违规项 [{idx}] 不是字典对象，跳过: {v}")
+                continue
+
+            user_id = v.get("user_id", "")
+            reason = v.get("reason", "")
+
+            # 验证user_id有效性
+            if not user_id or not isinstance(user_id, str) or user_id.strip() == "":
+                logger.warning(f"违规项 [{idx}] user_id无效，跳过")
+                continue
+
+            # 验证reason有效性
+            if not reason or not isinstance(reason, str):
+                logger.warning(f"用户 {user_id} 的reason字段无效，使用默认值")
+                reason = "违规内容"
+
+            valid_violations.append({
+                "user_id": user_id.strip(),
+                "reason": reason.strip()
+            })
+
+        return valid_violations
 
     @staticmethod
     def _extract_json_string(response: str) -> str:

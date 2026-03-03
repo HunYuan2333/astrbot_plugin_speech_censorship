@@ -34,8 +34,13 @@ class MessageBuffer:
             self.group_locks[group_id] = asyncio.Lock()
         return self.group_locks[group_id]
 
+    def _cleanup_empty_lock(self, group_id: str):
+        """当群组无消息时，清理对应的锁对象（防止内存泄漏）"""
+        if group_id in self.group_locks and group_id not in self.buffer:
+            del self.group_locks[group_id]
+
     def append_message(self, group_id: str, user_id: str, message: dict):
-        """向缓冲区添加消息"""
+        """向缓冲区添加消息（线程不安全警告：调用方需要确保同步）"""
         self.buffer[group_id][user_id].append(message)
 
     def get_total_messages(self, group_id: str) -> int:
@@ -62,7 +67,7 @@ class MessageBuffer:
 
         return snapshot
 
-    async def cleanup_old_messages(self, max_age_seconds: int = 3600):
+    def cleanup_old_messages(self, max_age_seconds: int = 3600):
         """清理超过 max_age_seconds 的旧消息"""
         current_time = time.time()
         cutoff_time = current_time - max_age_seconds
@@ -79,9 +84,10 @@ class MessageBuffer:
                 if not self.buffer[group_id][user_id]:
                     del self.buffer[group_id][user_id]
 
-            # 如果该群没有消息了，删除该群
+            # 如果该群没有消息了，删除该群并清理其锁
             if not self.buffer[group_id]:
                 del self.buffer[group_id]
+                self._cleanup_empty_lock(group_id)
 
     def trim_recent_messages(self, group_id: str, limit: int):
         """仅保留某群最近 N 条消息（跨用户全局窗口）。limit<=0 时不限制。"""
