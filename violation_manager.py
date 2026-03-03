@@ -19,13 +19,15 @@ class ViolationManager:
     - 定期清理过期记录（防止内存泄漏）
     """
 
-    def __init__(self, data_dir: Path):
+    def __init__(self, data_dir: Path, cooldown_seconds: int = 3600):
         """
         Args:
             data_dir: 数据保存目录路径
+            cooldown_seconds: 重复违规冷却时间（秒）
         """
         self.data_dir = data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.cooldown_seconds = int(cooldown_seconds)
 
         # 用户违规记录
         # 结构: {group_id: {user_id: {"count": int, "last_time": float, "created_time": float}}}
@@ -155,13 +157,13 @@ class ViolationManager:
         return self.records.get(group_id, {}).get(user_id)
 
     def check_repeated_violation(self, group_id: str, user_id: str,
-                                cooldown_seconds: int = 3600) -> bool:
+                                cooldown_seconds: Optional[int] = None) -> bool:
         """检查用户在冷却时间内是否已违规（防止重复禁言）
 
         Args:
             group_id: 群组 ID
             user_id: 用户 ID
-            cooldown_seconds: 冷却时间（秒）
+            cooldown_seconds: 冷却时间（秒），为空时使用管理器默认值
 
         Returns:
             True 表示在冷却期内已有违规记录，应该跳过禁言；
@@ -171,9 +173,11 @@ class ViolationManager:
         if not record or record.get("count", 0) == 0:
             return False
 
+        effective_cooldown = self.cooldown_seconds if cooldown_seconds is None else int(cooldown_seconds)
+
         last_violation_time = record.get("last_time", 0)
-        if time.time() - last_violation_time < cooldown_seconds:
-            logger.warning(f"[护栏] 用户 {user_id} 在 {cooldown_seconds}s 内已被处罚，跳过本次禁言")
+        if time.time() - last_violation_time < effective_cooldown:
+            logger.warning(f"[护栏] 用户 {user_id} 在 {effective_cooldown}s 内已被处罚，跳过本次禁言")
             return True
 
         return False

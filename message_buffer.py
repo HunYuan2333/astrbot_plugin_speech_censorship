@@ -43,6 +43,12 @@ class MessageBuffer:
         """向缓冲区添加消息（线程不安全警告：调用方需要确保同步）"""
         self.buffer[group_id][user_id].append(message)
 
+    async def append_message_with_lock(self, group_id: str, user_id: str, message: dict):
+        """在群组锁保护下添加消息"""
+        lock = self.get_or_create_lock(group_id)
+        async with lock:
+            self.append_message(group_id, user_id, message)
+
     def get_total_messages(self, group_id: str) -> int:
         """获取群组的总消息数"""
         if group_id not in self.buffer:
@@ -59,8 +65,10 @@ class MessageBuffer:
         if group_id not in self.buffer:
             return {}
 
-        # 创建快照
-        snapshot = dict(self.buffer[group_id])
+        # 深拷贝快照（复制到每个用户消息列表和消息字典）
+        snapshot: Dict[str, List[Dict]] = {}
+        for user_id, messages in self.buffer[group_id].items():
+            snapshot[user_id] = [dict(msg) for msg in messages]
 
         # 立即清空缓冲区，允许新消息写入
         self.buffer[group_id].clear()
@@ -75,10 +83,18 @@ class MessageBuffer:
         for group_id in list(self.buffer.keys()):
             for user_id in list(self.buffer[group_id].keys()):
                 # 过滤掉旧消息
-                self.buffer[group_id][user_id] = [
-                    msg for msg in self.buffer[group_id][user_id]
-                    if msg.get("timestamp", 0) >= cutoff_time
-                ]
+                valid_messages = []
+                for msg in self.buffer[group_id][user_id]:
+                    raw_timestamp = msg.get("timestamp", 0)
+                    try:
+                        timestamp_value = float(raw_timestamp)
+                    except (TypeError, ValueError):
+                        timestamp_value = 0.0
+
+                    if timestamp_value >= cutoff_time:
+                        valid_messages.append(msg)
+
+                self.buffer[group_id][user_id] = valid_messages
 
                 # 如果该用户没有消息了，删除该用户
                 if not self.buffer[group_id][user_id]:
@@ -88,6 +104,7 @@ class MessageBuffer:
             if not self.buffer[group_id]:
                 del self.buffer[group_id]
                 self._cleanup_empty_lock(group_id)
+                self.last_check_time.pop(group_id, None)
 
     def trim_recent_messages(self, group_id: str, limit: int):
         """仅保留某群最近 N 条消息（跨用户全局窗口）。limit<=0 时不限制。"""

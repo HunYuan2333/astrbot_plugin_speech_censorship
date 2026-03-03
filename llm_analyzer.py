@@ -73,9 +73,16 @@ class LLMAnalyzer:
                     logger.warning(f"用户 {user_id} 的消息字段格式异常，将跳过: {msg}")
                     continue
 
+                raw_timestamp = msg.get("timestamp", 0)
+                try:
+                    timestamp_value = float(raw_timestamp)
+                except (TypeError, ValueError):
+                    logger.warning(f"用户 {user_id} 的 timestamp 字段异常，使用0兜底: {raw_timestamp}")
+                    timestamp_value = 0.0
+
                 flattened.append({
                     "user_id": user_id,
-                    "timestamp": msg.get("timestamp", 0),
+                    "timestamp": timestamp_value,
                     "user_name": msg.get("user_name", "未知用户"),
                     "message": message_text
                 })
@@ -151,6 +158,10 @@ class LLMAnalyzer:
             except (ValueError, json.JSONDecodeError) as nested_error:
                 logger.error(f"无法解析LLM响应为JSON: {nested_error}")
                 return []
+
+        if not isinstance(data, dict):
+            logger.error(f"Schema验证失败：LLM顶层JSON不是对象，实际类型: {type(data).__name__}")
+            return []
 
         # 提取and验证violations字段
         violations = data.get("violations", [])

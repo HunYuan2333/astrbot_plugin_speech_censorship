@@ -1,5 +1,6 @@
 """禁言执行模块 - 负责禁言 API 调用和警告消息"""
 
+import asyncio
 from typing import Any, Dict, List, Optional
 
 from astrbot.api import logger
@@ -75,16 +76,20 @@ class BanExecutor:
         logger.info(f"禁言用户 {user_id}（群: {group_id}，原因: {reason}，时长: {ban_duration} 秒）")
 
         # 调用禁言 API（明确的单层异常捕获）
+        api_timeout_seconds = float(self.get_config("api_timeout_seconds", 10))
         try:
-            ret = await client.api.call_action(
-                'set_group_ban',
-                group_id=group_id_int,
-                user_id=user_id_int,
-                duration=ban_duration
+            ret = await asyncio.wait_for(
+                client.api.call_action(
+                    'set_group_ban',
+                    group_id=group_id_int,
+                    user_id=user_id_int,
+                    duration=ban_duration
+                ),
+                timeout=api_timeout_seconds,
             )
 
             # 检查禁言是否成功
-            if ret is None or (isinstance(ret, dict) and ret.get('retcode') == 0):
+            if isinstance(ret, dict) and ret.get('retcode') == 0:
                 logger.info(f"禁言成功: 用户 {user_id}")
 
                 # 发送警告消息
@@ -93,9 +98,12 @@ class BanExecutor:
 
                 return True
             else:
-                logger.error(f"禁言失败: {ret}")
+                logger.error(f"禁言失败: 无效返回 {ret}")
                 return False
 
+        except asyncio.TimeoutError:
+            logger.error(f"调用禁言 API 超时（>{api_timeout_seconds}s）")
+            return False
         except TypeError as te:
             # 处理参数类型相关错误
             logger.error(f"API 调用参数错误: {te}")
@@ -130,13 +138,12 @@ class BanExecutor:
         except Exception as e:
             logger.error(f"发送警告消息失败: {e}", exc_info=True)
 
-    def validate_and_should_ban(self, group_id: str, user_id: str,
+    def validate_and_should_ban(self, user_id: str,
                                messages_dict: Dict[str, List[Dict]],
                                reason: str) -> bool:
         """验证用户和应用防误杀护栏
 
         Args:
-            group_id: 群组 ID
             user_id: 用户 ID
             messages_dict: 本次分析的消息字典
             reason: 违规原因

@@ -112,7 +112,8 @@ class SpeechCensorshipPlugin(Star):
         llm_provider = self._get_config("llm_provider", "")
 
         # 初始化违规管理器并加载历史记录
-        self.violation_manager = ViolationManager(self.data_dir)
+        violation_cooldown_seconds = self._get_config("violation_cooldown_seconds", 3600)
+        self.violation_manager = ViolationManager(self.data_dir, violation_cooldown_seconds)
         await self.violation_manager.load_records()
 
         # 如果触发模式包含时间触发，启动定时器
@@ -247,13 +248,26 @@ class SpeechCensorshipPlugin(Star):
                 )
                 return
 
+            api_timeout_seconds = float(self._get_config("api_timeout_seconds", 10))
             try:
-                ret = await client.api.call_action(
-                    'set_group_ban',
-                    group_id=group_id_int,
-                    user_id=user_id_int,
-                    duration=test_duration
+                ret = await asyncio.wait_for(
+                    client.api.call_action(
+                        'set_group_ban',
+                        group_id=group_id_int,
+                        user_id=user_id_int,
+                        duration=test_duration
+                    ),
+                    timeout=api_timeout_seconds,
                 )
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"测试禁言 API 调用超时（>{api_timeout_seconds}s）：群 {group_id}，用户 {user_id}"
+                )
+                yield event.plain_result(
+                    f"❌ API 调用超时（>{api_timeout_seconds}s）\n"
+                    f"请检查 Bot 连接状态或平台响应。"
+                )
+                return
             except TypeError as te:
                 logger.error(f"调用禁言 API 参数错误: {te}", exc_info=True)
                 yield event.plain_result(
@@ -327,14 +341,17 @@ class SpeechCensorshipPlugin(Star):
             if enabled_groups and group_id not in [str(g) for g in enabled_groups]:
                 return
 
-            # 添加消息到缓冲区
-            self.message_buffer.append_message(group_id, user_id, {
-                "message": message_str,
-                "timestamp": timestamp,
-                "user_name": user_name
-            })
+            lock = self.message_buffer.get_or_create_lock(group_id)
+            async with lock:
+                # 添加消息到缓冲区（锁保护）
+                self.message_buffer.append_message(group_id, user_id, {
+                    "message": message_str,
+                    "timestamp": timestamp,
+                    "user_name": user_name
+                })
 
-            current_count = self.message_buffer.get_total_messages(group_id)
+                current_count = self.message_buffer.get_total_messages(group_id)
+
             batch_size = self._get_config("batch_size", 10)
             trigger_mode = self._get_config("trigger_mode", "hybrid")
 
@@ -343,16 +360,19 @@ class SpeechCensorshipPlugin(Star):
             )
 
             # 检查是否需要触发检测
-            if await self._should_trigger_check(group_id):
+            if await self._should_trigger_check(group_id, current_count):
                 await self._process_group_messages(group_id)
 
         except Exception as e:
             logger.error(f"处理群消息时出错: {e}", exc_info=True)
 
-    async def _should_trigger_check(self, group_id: str) -> bool:
+    async def _should_trigger_check(self, group_id: str, total_messages: Optional[int] = None) -> bool:
         """判断是否应该触发检测"""
         trigger_mode = self._get_config("trigger_mode", "hybrid")
-        total_messages = self.message_buffer.get_total_messages(group_id)
+        if total_messages is None:
+            lock = self.message_buffer.get_or_create_lock(group_id)
+            async with lock:
+                total_messages = self.message_buffer.get_total_messages(group_id)
         check_interval = self._get_config("check_interval", 60)
         batch_size = self._get_config("batch_size", 10)
 
@@ -392,7 +412,9 @@ class SpeechCensorshipPlugin(Star):
 
                 # 遍历所有群组
                 for group_id in list(self.message_buffer.buffer.keys()):
-                    total_messages = self.message_buffer.get_total_messages(group_id)
+                    lock = self.message_buffer.get_or_create_lock(group_id)
+                    async with lock:
+                        total_messages = self.message_buffer.get_total_messages(group_id)
 
                     # 如果有消息，则进行检测
                     if total_messages > 0:
@@ -405,7 +427,7 @@ class SpeechCensorshipPlugin(Star):
                                 logger.info(f"群 {group_id} 定时触发检测（消息数: {total_messages}）")
                                 await self._process_group_messages(group_id)
                         else:
-                            if await self._should_trigger_check(group_id):
+                            if await self._should_trigger_check(group_id, total_messages):
                                 logger.info(f"群 {group_id} 定时轮询触发检测（消息数: {total_messages}）")
                                 await self._process_group_messages(group_id)
 
@@ -452,11 +474,10 @@ class SpeechCensorshipPlugin(Star):
         """处理群组的累积消息（修复竞态条件和防止消息丢失）"""
         lock = self.message_buffer.get_or_create_lock(group_id)
 
-        # 第1阶段：在锁保护下，创建消息快照（不清除）
+        # 在锁保护下原子执行：深拷贝快照 + 立即清空缓冲区
         async with lock:
             try:
-                # 创建快照但不清空缓冲区（防止LLM失败时消息丢失）
-                messages_dict = dict(self.message_buffer.buffer.get(group_id, {}))
+                messages_dict = self.message_buffer.snapshot_and_clear(group_id)
 
                 if not messages_dict:
                     return
@@ -484,19 +505,6 @@ class SpeechCensorshipPlugin(Star):
                 group_id, messages_dict, llm_provider, default_rules, custom_rules
             )
 
-            # 第3阶段：LLM分析成功后，在锁保护下清除已处理消息
-            async with lock:
-                try:
-                    # 应用recent_message_limit限制
-                    recent_message_limit = self._get_config("recent_message_limit", 0)
-                    if recent_message_limit > 0:
-                        self.message_buffer.trim_recent_messages(group_id, recent_message_limit)
-
-                    # LLM分析成功，清空该批消息
-                    self.message_buffer.snapshot_and_clear(group_id)
-                except Exception as e:
-                    logger.error(f"清空缓冲区失败: {e}", exc_info=True)
-
             if violations:
                 logger.info(f"检测到 {len(violations)} 个违规用户")
 
@@ -510,14 +518,12 @@ class SpeechCensorshipPlugin(Star):
 
                     # 应用防误杀护栏
                     if not self.ban_executor.validate_and_should_ban(
-                        group_id, user_id, messages_dict, reason
+                        user_id, messages_dict, reason
                     ):
                         continue
 
                     # 检查重复违规冷却
-                    if self.violation_manager and self.violation_manager.check_repeated_violation(
-                        group_id, user_id
-                    ):
+                    if self.violation_manager and self.violation_manager.check_repeated_violation(group_id, user_id):
                         continue
 
                     # 执行禁言
@@ -531,7 +537,7 @@ class SpeechCensorshipPlugin(Star):
                 logger.info(f"群 {group_id} 未检测到违规内容")
 
         except Exception as e:
-            logger.error(f"LLM分析或后续处理失败: {e}，消息保留在缓冲区供重试", exc_info=True)
+            logger.error(f"LLM分析或后续处理失败: {e}", exc_info=True)
 
     async def terminate(self):
         """插件卸载时取消定时任务并保存数据"""
