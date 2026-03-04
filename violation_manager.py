@@ -34,6 +34,9 @@ class ViolationManager:
         # 嵌套结构更直观，避免键冲突问题
         self.records: Dict[str, Dict[str, Dict[str, Any]]] = defaultdict(dict)
 
+        # 用于保护 records 字典的读写锁
+        self._records_lock = asyncio.Lock()
+
     @property
     def records_file(self) -> Path:
         """违规记录文件路径"""
@@ -138,7 +141,7 @@ class ViolationManager:
         return nested
 
     def record_violation(self, group_id: str, user_id: str) -> dict:
-        """记录一次违规行为"""
+        """记录一次违规行为（同步版本，调用方负责加锁）"""
         record = self.records[group_id].get(user_id, {})
 
         # 更新违规次数和最后违规时间
@@ -152,9 +155,19 @@ class ViolationManager:
         self.records[group_id][user_id] = record
         return record
 
+    async def record_violation_async(self, group_id: str, user_id: str) -> dict:
+        """记录一次违规行为（异步版本，会自动加锁）"""
+        async with self._records_lock:
+            return self.record_violation(group_id, user_id)
+
     def get_violation_record(self, group_id: str, user_id: str) -> Optional[dict]:
-        """获取用户的违规记录"""
+        """获取用户的违规记录（同步版本，调用方负责加锁）"""
         return self.records.get(group_id, {}).get(user_id)
+
+    async def get_violation_record_async(self, group_id: str, user_id: str) -> Optional[dict]:
+        """获取用户的违规记录（异步版本，会自动加锁）"""
+        async with self._records_lock:
+            return self.get_violation_record(group_id, user_id)
 
     def check_repeated_violation(self, group_id: str, user_id: str,
                                 cooldown_seconds: Optional[int] = None) -> bool:
@@ -182,39 +195,51 @@ class ViolationManager:
 
         return False
 
+    async def check_repeated_violation_async(self, group_id: str, user_id: str,
+                                            cooldown_seconds: Optional[int] = None) -> bool:
+        """检查用户在冷却时间内是否已违规（异步版本，会自动加锁）"""
+        async with self._records_lock:
+            return self.check_repeated_violation(group_id, user_id, cooldown_seconds)
+
     async def cleanup_expired_records(self, max_age_days: int = 7):
         """清理超过 max_age_days 天的违规记录
 
         Args:
-            max_age_days: 记录最大保留天数
+            max_age_days: 记录最大保留天数（默认 7 天）
         """
         current_time = time.time()
         max_age_seconds = max_age_days * 24 * 3600
 
         expired_count = 0
-        for group_id in list(self.records.keys()):
-            for user_id in list(self.records[group_id].keys()):
-                record = self.records[group_id][user_id]
-                created_time = record.get("created_time", 0)
-                if created_time < (current_time - max_age_seconds):
-                    del self.records[group_id][user_id]
-                    expired_count += 1
+        async with self._records_lock:
+            for group_id in list(self.records.keys()):
+                for user_id in list(self.records[group_id].keys()):
+                    record = self.records[group_id][user_id]
+                    created_time = record.get("created_time", 0)
+                    if created_time < (current_time - max_age_seconds):
+                        del self.records[group_id][user_id]
+                        expired_count += 1
 
-            # 清理空的群组
-            if not self.records[group_id]:
-                del self.records[group_id]
+                # 清理空的群组
+                if not self.records[group_id]:
+                    del self.records[group_id]
 
         if expired_count > 0:
             logger.info(f"清理了 {expired_count} 条过期的违规记录")
             await self.save_records()
 
     def get_user_violation_count(self, group_id: str, user_id: str) -> int:
-        """获取用户的总违规次数"""
+        """获取用户的总违规次数（同步版本，调用方负责加锁）"""
         record = self.get_violation_record(group_id, user_id)
         return record.get("count", 0) if record else 0
 
+    async def get_user_violation_count_async(self, group_id: str, user_id: str) -> int:
+        """获取用户的总违规次数（异步版本，会自动加锁）"""
+        async with self._records_lock:
+            return self.get_user_violation_count(group_id, user_id)
+
     def get_stats(self) -> dict:
-        """获取违规统计信息"""
+        """获取违规统计信息（同步版本，调用方负责加锁）"""
         total_records = sum(len(users) for users in self.records.values())
         total_violations = sum(
             record.get("count", 0)
@@ -227,3 +252,8 @@ class ViolationManager:
             "total_violations": total_violations,
             "file_size": self.records_file.stat().st_size if self.records_file.exists() else 0,
         }
+
+    async def get_stats_async(self) -> dict:
+        """获取违规统计信息（异步版本，会自动加锁）"""
+        async with self._records_lock:
+            return self.get_stats()

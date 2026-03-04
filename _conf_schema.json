@@ -71,5 +71,41 @@
     "type": "string",
     "default": "⚠️ 用户 {user} 因 {reason} 已被禁言 {duration} 秒。请注意文明发言。",
     "hint": "支持变量: {user}(用户ID), {reason}(违规原因), {duration}(禁言时长)"
+  },
+  "llm_api_timeout": {
+    "description": "LLM API 响应超时（秒）",
+    "type": "int",
+    "default": 30,
+    "hint": "LLM 调用的超时时间，超过此时间未收到响应则判定为超时，单位为秒"
+  },
+  "api_timeout_seconds": {
+    "description": "平台 API 调用超时（秒）",
+    "type": "int",
+    "default": 60,
+    "hint": "调用群聊平台 API（如禁言）的超时时间，单位为秒"
+  },
+  "message_buffer_max_age": {
+    "description": "消息缓冲过期时间（秒）",
+    "type": "int",
+    "default": 3600,
+    "hint": "超过此时间的旧消息将被清理，防止内存泄漏，单位为秒"
+  },
+  "violation_cooldown_seconds": {
+    "description": "用户违规冷却期（秒）",
+    "type": "int",
+    "default": 3600,
+    "hint": "同一用户在冷却期内新增违规将被忽略（防止重复禁言），单位为秒"
+  },
+  "event_cache_max_age": {
+    "description": "事件缓存过期时间（秒）",
+    "type": "int",
+    "default": 1800,
+    "hint": "事件缓存超过此时间后将被清理，单位为秒"
+  },
+  "violation_records_expire_days": {
+    "description": "违规记录保留天数",
+    "type": "int",
+    "default": 7,
+    "hint": "超过此天数的违规记录将被自动清理，单位为天"
   }
 }

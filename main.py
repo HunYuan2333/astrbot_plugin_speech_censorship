@@ -64,6 +64,20 @@ class SpeechCensorshipPlugin(Star):
         self.latest_events: Dict[str, AstrMessageEvent] = {}
         self.latest_event_timestamps: Dict[str, float] = {}
 
+        # 保护 latest_events 字典的锁
+        self._events_dict_lock = asyncio.Lock()
+
+        # 群组处理状态跟踪（防止重复处理）
+        # 状态机：IDLE -> PROCESSING -> IDLE
+        # 结构: {group_id: {"status": "IDLE"|"PROCESSING", "lock": asyncio.Lock}}
+        self.group_processing_states: Dict[str, str] = {}
+        self._processing_states_lock = asyncio.Lock()
+
+        # 重试队列：用于存储失败需要重试的群组信息
+        # 结构：[(group_id, messages_dict, retry_count, timestamp), ...]
+        self.retry_queue: List[tuple] = []
+        self._retry_queue_lock = asyncio.Lock()
+
         # 缓存的导入（用于防止平台耦合）
         self._aiocqhttp_event_class = None
 
@@ -100,10 +114,136 @@ class SpeechCensorshipPlugin(Star):
             # 在极端情况下，仍然抛出异常而不是降级，以防止配置隐式失败
             raise
 
-    def _touch_latest_event(self, group_id: str, event: AstrMessageEvent):
+    async def _touch_latest_event(self, group_id: str, event: AstrMessageEvent):
         """更新群组最近事件引用及时间戳"""
-        self.latest_events[group_id] = event
-        self.latest_event_timestamps[group_id] = time.time()
+        async with self._events_dict_lock:
+            self.latest_events[group_id] = event
+            self.latest_event_timestamps[group_id] = time.time()
+
+    async def _get_latest_event(self, group_id: str) -> Optional[AstrMessageEvent]:
+        """安全地获取群组的最新event"""
+        async with self._events_dict_lock:
+            return self.latest_events.get(group_id)
+
+    async def _try_acquire_processing_lock(self, group_id: str) -> bool:
+        """尝试获取群组的处理锁（防止重复处理）
+
+        返回 True 表示成功获得锁，群组进入 PROCESSING 状态
+        返回 False 表示群组已在处理中，需要跳过
+        """
+        async with self._processing_states_lock:
+            if self.group_processing_states.get(group_id) == "PROCESSING":
+                logger.warning(f"群 {group_id} 正在处理中，跳过本轮检测")
+                return False
+
+            self.group_processing_states[group_id] = "PROCESSING"
+            return True
+
+    async def _release_processing_lock(self, group_id: str):
+        """释放群组的处理锁，恢复到 IDLE 状态"""
+        async with self._processing_states_lock:
+            self.group_processing_states[group_id] = "IDLE"
+
+    async def _enqueue_retry(self, group_id: str, messages_dict: Dict, retry_count: int = 0):
+        """将失败的消息加入重试队列
+
+        Args:
+            group_id: 群组 ID
+            messages_dict: 消息字典
+            retry_count: 已重试次数
+        """
+        max_retries = 3
+        if retry_count >= max_retries:
+            logger.warning(f"群 {group_id} 已达到最大重试次数({max_retries})，放弃处理")
+            return
+
+        async with self._retry_queue_lock:
+            self.retry_queue.append((group_id, messages_dict, retry_count, time.time()))
+            logger.info(f"群 {group_id} 消息已加入重试队列（重试次数: {retry_count}/3）")
+
+    async def _process_retry_queue(self):
+        """处理重试队列中的消息
+
+        用于定时任务中，处理之前失败需要重试的消息
+        """
+        if not self.retry_queue:
+            return
+
+        async with self._retry_queue_lock:
+            items_to_process = self.retry_queue.copy()
+            self.retry_queue.clear()
+
+        logger.info(f"开始处理重试队列（{len(items_to_process)}项）")
+
+        for group_id, messages_dict, retry_count, enqueue_time in items_to_process:
+            try:
+                # 增加重试计数
+                new_retry_count = retry_count + 1
+                logger.info(f"重试群 {group_id} 的消息分析（重试次数: {new_retry_count}/3）")
+
+                # 重新处理这个群组的消息
+                # 为了避免重复进入PROCESSING，我们不再设置处理状态，直接处理
+                lock = await self.message_buffer.get_or_create_lock(group_id)
+                trigger_mode = self._get_config("trigger_mode", "hybrid")
+                recent_limit = int(self._get_config("recent_message_limit", 50)) if trigger_mode == "strict_hybrid" else 0
+
+                # 执行LLM分析
+                try:
+                    llm_provider = self._get_config("llm_provider", "")
+                    if not llm_provider:
+                        logger.warning(f"群 {group_id} 未配置 LLM 提供商，放弃重试")
+                        continue
+
+                    default_rules = self._get_config("default_review_rules", "")
+                    custom_rules = self._get_config("custom_review_rules", "")
+                    llm_api_timeout = float(self._get_config("llm_api_timeout", 30))
+
+                    violations, error_code, should_retry = await self.llm_analyzer.analyze_messages(
+                        group_id, messages_dict, llm_provider, default_rules, custom_rules,
+                        llm_api_timeout=llm_api_timeout
+                    )
+
+                    # 重新检查重试条件
+                    if error_code != "success":
+                        if should_retry and new_retry_count < 3:
+                            # 继续重试
+                            await self._enqueue_retry(group_id, messages_dict, new_retry_count)
+                        else:
+                            # 放弃重试
+                            logger.error(f"群 {group_id} 重试失败: error_code={error_code}，放弃处理")
+                        continue
+
+                    # 成功：执行禁言逻辑
+                    if violations:
+                        logger.info(f"重试成功：群 {group_id} 检测到 {len(violations)} 个违规用户")
+
+                        for violation in violations:
+                            user_id = violation.get("user_id")
+                            reason = violation.get("reason", "违规内容")
+
+                            if not user_id or not self.ban_executor.validate_and_should_ban(user_id, messages_dict, reason):
+                                continue
+
+                            if self.violation_manager and await self.violation_manager.check_repeated_violation_async(group_id, user_id):
+                                continue
+
+                            event = await self._get_latest_event(group_id)
+                            if event and await self.ban_executor.ban_user(event, group_id, user_id, reason):
+                                if self.violation_manager:
+                                    await self.violation_manager.record_violation_async(group_id, user_id)
+
+                        if self.violation_manager:
+                            await self.violation_manager.save_records()
+                    else:
+                        logger.info(f"重试成功：群 {group_id} 无违规内容")
+
+                except Exception as e:
+                    logger.error(f"重试群 {group_id} 的分析失败: {e}", exc_info=True)
+                    if new_retry_count < 3:
+                        await self._enqueue_retry(group_id, messages_dict, new_retry_count)
+
+            except Exception as e:
+                logger.error(f"处理重试队列项失败: {e}", exc_info=True)
 
     async def initialize(self):
         """插件初始化：加载配置、启动定时任务"""
@@ -142,7 +282,7 @@ class SpeechCensorshipPlugin(Star):
             for users in self.message_buffer.buffer.values()
         ) if total_groups > 0 else 0
 
-        stats = self.violation_manager.get_stats() if self.violation_manager else {}
+        stats = await self.violation_manager.get_stats_async() if self.violation_manager else {}
 
         yield event.plain_result(
             "审核状态:\n"
@@ -189,7 +329,7 @@ class SpeechCensorshipPlugin(Star):
                 return
 
             # 刷新该群最近事件引用
-            self._touch_latest_event(group_id, event)
+            await self._touch_latest_event(group_id, event)
 
             total_messages = self.message_buffer.get_total_messages(group_id)
             if total_messages == 0:
@@ -248,7 +388,7 @@ class SpeechCensorshipPlugin(Star):
                 )
                 return
 
-            api_timeout_seconds = float(self._get_config("api_timeout_seconds", 10))
+            api_timeout_seconds = float(self._get_config("api_timeout_seconds", 60))
             try:
                 ret = await asyncio.wait_for(
                     client.api.call_action(
@@ -283,7 +423,7 @@ class SpeechCensorshipPlugin(Star):
                 )
                 return
 
-            if ret is None or (isinstance(ret, dict) and ret.get('retcode') == 0):
+            if self.ban_executor.is_ban_api_success(ret):
                 logger.info(f"测试禁言成功：用户 {user_id}")
                 yield event.plain_result(
                     f"✅ 测试成功！用户 {user_name}（{user_id}）已被禁言 {test_duration} 秒。\n"
@@ -322,7 +462,7 @@ class SpeechCensorshipPlugin(Star):
                 return
 
             # 保存最新的 event 对象
-            self._touch_latest_event(group_id, event)
+            await self._touch_latest_event(group_id, event)
 
             # 不缓冲机器人自身消息
             if self_id and user_id == self_id:
@@ -341,7 +481,7 @@ class SpeechCensorshipPlugin(Star):
             if enabled_groups and group_id not in [str(g) for g in enabled_groups]:
                 return
 
-            lock = self.message_buffer.get_or_create_lock(group_id)
+            lock = await self.message_buffer.get_or_create_lock(group_id)
             async with lock:
                 # 添加消息到缓冲区（锁保护）
                 self.message_buffer.append_message(group_id, user_id, {
@@ -349,6 +489,11 @@ class SpeechCensorshipPlugin(Star):
                     "timestamp": timestamp,
                     "user_name": user_name
                 })
+
+                trigger_mode = self._get_config("trigger_mode", "hybrid")
+                if trigger_mode == "strict_hybrid":
+                    recent_limit = int(self._get_config("recent_message_limit", 50))
+                    self.message_buffer.trim_recent_messages(group_id, recent_limit)
 
                 current_count = self.message_buffer.get_total_messages(group_id)
 
@@ -367,37 +512,39 @@ class SpeechCensorshipPlugin(Star):
             logger.error(f"处理群消息时出错: {e}", exc_info=True)
 
     async def _should_trigger_check(self, group_id: str, total_messages: Optional[int] = None) -> bool:
-        """判断是否应该触发检测"""
+        """判断是否应该触发检测（原子操作：检查+决策在同一把锁内）"""
         trigger_mode = self._get_config("trigger_mode", "hybrid")
-        if total_messages is None:
-            lock = self.message_buffer.get_or_create_lock(group_id)
-            async with lock:
-                total_messages = self.message_buffer.get_total_messages(group_id)
         check_interval = self._get_config("check_interval", 60)
         batch_size = self._get_config("batch_size", 10)
 
-        last_check = self.message_buffer.get_check_time(group_id)
-        current_time = time.time()
-        time_elapsed = current_time - last_check
+        # 原子性保证：获取计数和判断触发条件在同一把锁内
+        lock = await self.message_buffer.get_or_create_lock(group_id)
+        async with lock:
+            if total_messages is None:
+                total_messages = self.message_buffer.get_total_messages(group_id)
 
-        if trigger_mode == "time_only":
-            return False
-        elif trigger_mode == "count_only":
-            if total_messages < batch_size:
-                logger.info(f"count_only 未触发：群 {group_id} 当前 {total_messages}/{batch_size}")
-            return total_messages >= batch_size
-        elif trigger_mode == "hybrid":
-            time_triggered = time_elapsed >= check_interval
-            count_triggered = total_messages >= batch_size
-            return time_triggered or count_triggered
-        elif trigger_mode == "strict_hybrid":
-            time_triggered = time_elapsed >= check_interval
-            count_triggered = total_messages >= batch_size
-            if not (time_triggered and count_triggered):
-                logger.info(
-                    f"strict_hybrid 未触发：群 {group_id} time_ok={time_triggered}, count={total_messages}/{batch_size}"
-                )
-            return time_triggered and count_triggered
+            last_check = self.message_buffer.get_check_time(group_id)
+            current_time = time.time()
+            time_elapsed = current_time - last_check
+
+            if trigger_mode == "time_only":
+                return False
+            elif trigger_mode == "count_only":
+                if total_messages < batch_size:
+                    logger.info(f"count_only 未触发：群 {group_id} 当前 {total_messages}/{batch_size}")
+                return total_messages >= batch_size
+            elif trigger_mode == "hybrid":
+                time_triggered = time_elapsed >= check_interval
+                count_triggered = total_messages >= batch_size
+                return time_triggered or count_triggered
+            elif trigger_mode == "strict_hybrid":
+                time_triggered = time_elapsed >= check_interval
+                count_triggered = total_messages >= batch_size
+                if not (time_triggered and count_triggered):
+                    logger.info(
+                        f"strict_hybrid 未触发：群 {group_id} time_ok={time_triggered}, count={total_messages}/{batch_size}"
+                    )
+                return time_triggered and count_triggered
 
         return False
 
@@ -410,9 +557,15 @@ class SpeechCensorshipPlugin(Star):
 
                 logger.debug("执行定时检测...")
 
-                # 遍历所有群组
-                for group_id in list(self.message_buffer.buffer.keys()):
-                    lock = self.message_buffer.get_or_create_lock(group_id)
+                # 首先处理重试队列（如果有）
+                if self.retry_queue:
+                    logger.debug(f"开始处理{len(self.retry_queue)}条重试消息")
+                    await self._process_retry_queue()
+
+                # 遍历所有群组，筛选本轮需要检测的群
+                groups_to_process: List[str] = []
+                for group_id in self.message_buffer.get_group_ids_snapshot():
+                    lock = await self.message_buffer.get_or_create_lock(group_id)
                     async with lock:
                         total_messages = self.message_buffer.get_total_messages(group_id)
 
@@ -425,21 +578,33 @@ class SpeechCensorshipPlugin(Star):
                         if trigger_mode == "time_only":
                             if time_elapsed >= check_interval:
                                 logger.info(f"群 {group_id} 定时触发检测（消息数: {total_messages}）")
-                                await self._process_group_messages(group_id)
+                                groups_to_process.append(group_id)
                         else:
                             if await self._should_trigger_check(group_id, total_messages):
                                 logger.info(f"群 {group_id} 定时轮询触发检测（消息数: {total_messages}）")
-                                await self._process_group_messages(group_id)
+                                groups_to_process.append(group_id)
 
-                # 清理过期消息（超过 1 小时）
-                self.message_buffer.cleanup_old_messages()
+                # 并发处理，避免单个群处理慢导致全局队头阻塞
+                if groups_to_process:
+                    results = await asyncio.gather(
+                        *(self._process_group_messages(group_id) for group_id in groups_to_process),
+                        return_exceptions=True,
+                    )
+                    for group_id, result in zip(groups_to_process, results):
+                        if isinstance(result, Exception):
+                            logger.error(f"群 {group_id} 定时并发检测失败: {result}", exc_info=True)
+
+                # 清理过期消息
+                message_buffer_max_age = int(self._get_config("message_buffer_max_age", 3600))
+                self.message_buffer.cleanup_old_messages(max_age_seconds=message_buffer_max_age)
 
                 # 清理过期违规记录
                 if self.violation_manager:
-                    await self.violation_manager.cleanup_expired_records()
+                    violation_records_expire_days = int(self._get_config("violation_records_expire_days", 7))
+                    await self.violation_manager.cleanup_expired_records(max_age_days=violation_records_expire_days)
 
                 # 清理已清空的群组的event缓存（防止内存泄漏）
-                self._cleanup_stale_events()
+                await self._cleanup_stale_events()
 
             except asyncio.CancelledError:
                 logger.info("定时检测任务被取消")
@@ -447,97 +612,140 @@ class SpeechCensorshipPlugin(Star):
             except Exception as e:
                 logger.error(f"定时检测出错: {e}", exc_info=True)
 
-    def _cleanup_stale_events(self):
+    async def _cleanup_stale_events(self):
         """清理不再活跃的群组的event缓存"""
         active_groups = {
             group_id
-            for group_id in self.message_buffer.buffer.keys()
+            for group_id in self.message_buffer.get_group_ids_snapshot()
             if self.message_buffer.get_total_messages(group_id) > 0
         }
         current_time = time.time()
         max_event_age_seconds = self._get_config("event_cache_max_age", 1800)
 
-        stale_groups = [
-            gid for gid in list(self.latest_events.keys())
-            if (gid not in active_groups)
-            or (current_time - self.latest_event_timestamps.get(gid, 0) > max_event_age_seconds)
-        ]
+        async with self._events_dict_lock:
+            stale_groups = [
+                gid for gid in list(self.latest_events.keys())
+                if (gid not in active_groups)
+                or (current_time - self.latest_event_timestamps.get(gid, 0) > max_event_age_seconds)
+            ]
 
-        for group_id in stale_groups:
-            del self.latest_events[group_id]
-            self.latest_event_timestamps.pop(group_id, None)
+            for group_id in stale_groups:
+                del self.latest_events[group_id]
+                self.latest_event_timestamps.pop(group_id, None)
 
         if stale_groups:
             logger.debug(f"清理了 {len(stale_groups)} 个不活跃群组的event缓存")
 
     async def _process_group_messages(self, group_id: str):
         """处理群组的累积消息（修复竞态条件和防止消息丢失）"""
-        lock = self.message_buffer.get_or_create_lock(group_id)
+        # 第0阶段：尝试获取处理锁，防止重复处理
+        if not await self._try_acquire_processing_lock(group_id):
+            return
 
-        # 在锁保护下原子执行：深拷贝快照 + 立即清空缓冲区
-        async with lock:
-            try:
-                messages_dict = self.message_buffer.snapshot_and_clear(group_id)
+        try:
+            lock = await self.message_buffer.get_or_create_lock(group_id)
+            trigger_mode = self._get_config("trigger_mode", "hybrid")
+            recent_limit = int(self._get_config("recent_message_limit", 50)) if trigger_mode == "strict_hybrid" else 0
 
-                if not messages_dict:
+            # 在锁保护下原子执行：深拷贝快照 + 立即清空缓冲区
+            async with lock:
+                try:
+                    messages_dict = self.message_buffer.snapshot_and_clear(group_id)
+
+                    if not messages_dict:
+                        return
+
+                    total_count = sum(len(msgs) for msgs in messages_dict.values())
+                    logger.info(f"群 {group_id} 获取消息快照（{total_count} 条），即将进行 LLM 分析...")
+                except Exception as e:
+                    logger.error(f"缓冲区快照获取失败: {e}", exc_info=True)
                     return
 
-                total_count = sum(len(msgs) for msgs in messages_dict.values())
-                logger.info(f"群 {group_id} 获取消息快照（{total_count} 条），即将进行 LLM 分析...")
+            # 第2阶段：释放锁后进行耗时的LLM分析；若失败则回灌快照，避免消息丢失
+            try:
+                llm_provider = self._get_config("llm_provider", "")
+                if not llm_provider:
+                    logger.warning(f"群 {group_id} 未配置 LLM 提供商，跳过分析")
+                    async with lock:
+                        self.message_buffer.restore_snapshot(group_id, messages_dict, recent_limit)
+                    return
 
-                # 更新检测时间
+                default_rules = self._get_config("default_review_rules", "")
+                custom_rules = self._get_config("custom_review_rules", "")
+                llm_api_timeout = float(self._get_config("llm_api_timeout", 30))
+
+                violations, error_code, should_retry = await self.llm_analyzer.analyze_messages(
+                    group_id, messages_dict, llm_provider, default_rules, custom_rules,
+                    llm_api_timeout=llm_api_timeout
+                )
+
+                # 处理 LLM 异常（P0 修复：所有失败都回灌，避免消息丢失）
+                if error_code != "success":
+                    logger.warning(f"LLM 分析返回错误: error_code={error_code}, should_retry={should_retry}")
+
+                    # CRITICAL: 无论是否重试，都必须回灌消息
+                    async with lock:
+                        self.message_buffer.restore_snapshot(group_id, messages_dict, recent_limit)
+
+                    if should_retry:
+                        # 网络临时错误：加入重试队列
+                        await self._enqueue_retry(group_id, messages_dict, retry_count=0)
+                        logger.info(f"群 {group_id} 消息已回灌并加入重试队列（网络错误，将重试）")
+                    else:
+                        # 非临时错误也要回灌，防止消息永久丢失
+                        logger.warning(f"群 {group_id} 分析失败且不重试，消息已回灌到缓冲区")
+
                 self.message_buffer.update_check_time(group_id)
+
             except Exception as e:
-                logger.error(f"缓冲区快照获取失败: {e}", exc_info=True)
+                async with lock:
+                    self.message_buffer.restore_snapshot(group_id, messages_dict, recent_limit)
+                logger.error(f"LLM分析失败，已回灌消息快照: {e}", exc_info=True)
                 return
 
-        # 第2阶段：释放锁后进行耗时的LLM分析
-        try:
-            llm_provider = self._get_config("llm_provider", "")
-            if not llm_provider:
-                logger.warning(f"群 {group_id} 未配置 LLM 提供商，跳过分析")
-                return
+            try:
+                records_updated = False
 
-            default_rules = self._get_config("default_review_rules", "")
-            custom_rules = self._get_config("custom_review_rules", "")
+                if violations:
+                    logger.info(f"检测到 {len(violations)} 个违规用户")
 
-            violations = await self.llm_analyzer.analyze_messages(
-                group_id, messages_dict, llm_provider, default_rules, custom_rules
-            )
+                    # 对每个违规用户执行禁言
+                    for violation in violations:
+                        user_id = violation.get("user_id")
+                        reason = violation.get("reason", "违规内容")
 
-            if violations:
-                logger.info(f"检测到 {len(violations)} 个违规用户")
+                        if not user_id:
+                            continue
 
-                # 对每个违规用户执行禁言
-                for violation in violations:
-                    user_id = violation.get("user_id")
-                    reason = violation.get("reason", "违规内容")
+                        # 应用防误杀护栏
+                        if not self.ban_executor.validate_and_should_ban(
+                            user_id, messages_dict, reason
+                        ):
+                            continue
 
-                    if not user_id:
-                        continue
+                        # 检查重复违规冷却
+                        if self.violation_manager and await self.violation_manager.check_repeated_violation_async(group_id, user_id):
+                            continue
 
-                    # 应用防误杀护栏
-                    if not self.ban_executor.validate_and_should_ban(
-                        user_id, messages_dict, reason
-                    ):
-                        continue
+                        # 执行禁言
+                        event = await self._get_latest_event(group_id)
+                        if event and await self.ban_executor.ban_user(event, group_id, user_id, reason):
+                            # 记录违规（仅在禁言成功时）
+                            if self.violation_manager:
+                                await self.violation_manager.record_violation_async(group_id, user_id)
+                                records_updated = True
 
-                    # 检查重复违规冷却
-                    if self.violation_manager and self.violation_manager.check_repeated_violation(group_id, user_id):
-                        continue
+                    if records_updated and self.violation_manager:
+                        await self.violation_manager.save_records()
+                else:
+                    logger.info(f"群 {group_id} 未检测到违规内容")
 
-                    # 执行禁言
-                    event = self.latest_events.get(group_id)
-                    if event and await self.ban_executor.ban_user(event, group_id, user_id, reason):
-                        # 记录违规（仅在禁言成功时）
-                        if self.violation_manager:
-                            self.violation_manager.record_violation(group_id, user_id)
-                            await self.violation_manager.save_records()
-            else:
-                logger.info(f"群 {group_id} 未检测到违规内容")
+            except Exception as e:
+                logger.error(f"违规处置流程失败: {e}", exc_info=True)
 
-        except Exception as e:
-            logger.error(f"LLM分析或后续处理失败: {e}", exc_info=True)
+        finally:
+            # 无论成功失败，都要释放处理锁
+            await self._release_processing_lock(group_id)
 
     async def terminate(self):
         """插件卸载时取消定时任务并保存数据"""

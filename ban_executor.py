@@ -25,6 +25,11 @@ class BanExecutor:
         self.get_aiocqhttp_event_class = get_aiocqhttp_event_class
         self.get_config = get_config
 
+    @staticmethod
+    def is_ban_api_success(ret: Any) -> bool:
+        """统一禁言 API 成功判定口径。"""
+        return ret is None or (isinstance(ret, dict) and ret.get('retcode') == 0)
+
     async def ban_user(self, event: AstrMessageEvent, group_id: str, user_id: str, reason: str) -> bool:
         """禁言用户并发送警告消息
 
@@ -76,7 +81,7 @@ class BanExecutor:
         logger.info(f"禁言用户 {user_id}（群: {group_id}，原因: {reason}，时长: {ban_duration} 秒）")
 
         # 调用禁言 API（明确的单层异常捕获）
-        api_timeout_seconds = float(self.get_config("api_timeout_seconds", 10))
+        api_timeout_seconds = float(self.get_config("api_timeout_seconds", 60))
         try:
             ret = await asyncio.wait_for(
                 client.api.call_action(
@@ -89,7 +94,7 @@ class BanExecutor:
             )
 
             # 检查禁言是否成功
-            if isinstance(ret, dict) and ret.get('retcode') == 0:
+            if self.is_ban_api_success(ret):
                 logger.info(f"禁言成功: 用户 {user_id}")
 
                 # 发送警告消息
@@ -141,7 +146,7 @@ class BanExecutor:
     def validate_and_should_ban(self, user_id: str,
                                messages_dict: Dict[str, List[Dict]],
                                reason: str) -> bool:
-        """验证用户和应用防误杀护栏
+        """验证用户和应用分层防误杀护栏
 
         Args:
             user_id: 用户 ID
@@ -151,16 +156,41 @@ class BanExecutor:
         Returns:
             True 则执行禁言，False 则跳过
         """
-        # 1. 用户集合约束：检验 user_id 是否在本次 messages_dict 中出现
+        # 层级1：用户集合约束（必须）
+        # 检验 user_id 是否在本次 messages_dict 中出现
         if user_id not in messages_dict:
-            logger.warning(f"[护栏] 用户 {user_id} 不在本次消息记录中，疑似 LLM 幻觉，跳过禁言")
+            logger.warning(f"[护栏L1-用户存在性] 用户 {user_id} 不在本次消息记录中，疑似 LLM 幻觉，阻止禁言")
             return False
 
-        # 2. 消息数量检查：确保至少有 1 条以上的违规消息
         user_messages = messages_dict.get(user_id, [])
         if not user_messages:
-            logger.warning(f"[护栏] 用户 {user_id} 没有对应消息，跳过禁言")
+            logger.warning(f"[护栏L1-消息存在性] 用户 {user_id} 检索结果为空，阻止禁言")
             return False
 
-        logger.info(f"[护栏验证通过] 用户 {user_id} 将被禁言，原因：{reason}")
+        # 层级2：消息数量检查（推荐）
+        # 确保至少有 2 条消息，防止单条消息误杀
+        message_count = len(user_messages)
+        if message_count < 2:
+            logger.warning(f"[护栏L2-消息数量] 用户 {user_id} 仅有 {message_count} 条消息（需≥2），按警告处理")
+            return False
+
+        # 层级3：时间跨度检查（推荐）
+        # 确保违规消息跨越一定时间，避免短时间内的孤立事件被过度惩罚
+        if len(user_messages) >= 2:
+            timestamps = [msg.get("timestamp", 0) for msg in user_messages]
+            valid_timestamps = [ts for ts in timestamps if ts > 0]
+
+            if len(valid_timestamps) >= 2:
+                time_span = max(valid_timestamps) - min(valid_timestamps)
+                min_time_span = 30  # 最小30秒跨度
+
+                if time_span < min_time_span:
+                    logger.warning(
+                        f"[护栏L3-时间跨度] 用户 {user_id} 的消息时间跨度仅 {time_span}s（需>30s），按警告处理"
+                    )
+                    return False
+                else:
+                    logger.debug(f"[护栏L3-时间跨度] 用户 {user_id} 通过（时间跨度: {time_span}s）")
+
+        logger.info(f"[护栏验证通过] 用户 {user_id} 将被禁言（消息数: {message_count}，原因: {reason}）")
         return True
