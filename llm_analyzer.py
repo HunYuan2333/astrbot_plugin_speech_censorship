@@ -9,6 +9,12 @@ from typing import Any, Dict, List, Optional
 from astrbot.api import logger
 
 
+JSON_FENCED_BLOCK_PATTERN = re.compile(r'```json\s*\n?(.*?)\n?```', re.DOTALL)
+GENERIC_FENCED_BLOCK_PATTERN = re.compile(r'```\s*\n?(.*?)\n?```', re.DOTALL)
+LANGUAGE_PREFIX_PATTERN = re.compile(r'^(javascript|json|python|js)[\s\n]*', re.IGNORECASE)
+JSON_OBJECT_PATTERN = re.compile(r'\{.*\}', re.DOTALL)
+
+
 class LLMAnalyzer:
     """LLM 分析器
 
@@ -267,22 +273,22 @@ class LLMAnalyzer:
         """从响应中提取 JSON 字符串（使用正则精确提取）"""
         # 策略1：提取 Markdown 代码块（json标记）
         if "```json" in response:
-            match = re.search(r'```json\s*\n?(.*?)\n?```', response, re.DOTALL)
+            match = JSON_FENCED_BLOCK_PATTERN.search(response)
             if match:
                 return match.group(1).strip()
 
         # 策略2：提取 Markdown 代码块（通用）
         if "```" in response:
-            match = re.search(r'```\s*\n?(.*?)\n?```', response, re.DOTALL)
+            match = GENERIC_FENCED_BLOCK_PATTERN.search(response)
             if match:
                 content = match.group(1).strip()
                 # 移除可能的语言标记
-                content = re.sub(r'^(javascript|json|python|js)[\s\n]*', '', content, flags=re.IGNORECASE)
+                content = LANGUAGE_PREFIX_PATTERN.sub('', content)
                 return content.strip()
 
         # 策略3：精确提取 JSON 对象（使用正则找到首个{，然后从末尾向前找匹配的}）
         # 这比使用 rfind("}") 更准确，因为会考虑嵌套结构
-        match = re.search(r'\{.*\}', response, re.DOTALL)
+        match = JSON_OBJECT_PATTERN.search(response)
         if match:
             json_candidate = match.group()
             # 尝试解析，如果失败则继续

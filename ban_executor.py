@@ -1,7 +1,7 @@
 """禁言执行模块 - 负责禁言 API 调用和警告消息"""
 
 import asyncio
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Type
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
@@ -16,7 +16,11 @@ class BanExecutor:
     - 验证和防误杀护栏
     """
 
-    def __init__(self, get_aiocqhttp_event_class, get_config):
+    def __init__(
+        self,
+        get_aiocqhttp_event_class: Callable[[], Optional[Type[Any]]],
+        get_config: Callable[[str, Any], Any],
+    ):
         """
         Args:
             get_aiocqhttp_event_class: 获取 AiocqhttpMessageEvent 类的方法
@@ -28,7 +32,7 @@ class BanExecutor:
     @staticmethod
     def is_ban_api_success(ret: Any) -> bool:
         """统一禁言 API 成功判定口径。"""
-        return ret is None or (isinstance(ret, dict) and ret.get('retcode') == 0)
+        return isinstance(ret, dict) and ret.get('retcode') == 0
 
     async def ban_user(self, event: AstrMessageEvent, group_id: str, user_id: str, reason: str) -> bool:
         """禁言用户并发送警告消息

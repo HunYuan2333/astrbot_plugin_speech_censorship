@@ -7,9 +7,11 @@
 """
 
 import asyncio
+import copy
 import time
+from collections import deque
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import filter, AstrMessageEvent
@@ -35,6 +37,7 @@ class SpeechCensorshipPlugin(Star):
     REQUIRED_JSON_FORMAT = (
         '{"violations":[{"user_id":"123456","reason":"阴阳怪气/争吵/敏感话题"}]}'
     )
+    RETRY_QUEUE_MAX_DEFAULT = 500
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -75,8 +78,16 @@ class SpeechCensorshipPlugin(Star):
 
         # 重试队列：用于存储失败需要重试的群组信息
         # 结构：[(group_id, messages_dict, retry_count, timestamp), ...]
-        self.retry_queue: List[tuple] = []
+        self.retry_queue: Deque[Tuple[str, Dict[str, List[Dict]], int, float]] = deque()
         self._retry_queue_lock = asyncio.Lock()
+        self._retry_queue_max_size = int(
+            self._get_config("retry_queue_max_size", self.RETRY_QUEUE_MAX_DEFAULT)
+        )
+
+        # 运行时配置缓存（避免高频消息路径中反复构建列表）
+        self._whitelist_user_ids: Set[str] = set()
+        self._enabled_group_ids: Set[str] = set()
+        self._group_filter_enabled = False
 
         # 缓存的导入（用于防止平台耦合）
         self._aiocqhttp_event_class = None
@@ -158,8 +169,25 @@ class SpeechCensorshipPlugin(Star):
             return
 
         async with self._retry_queue_lock:
-            self.retry_queue.append((group_id, messages_dict, retry_count, time.time()))
+            if len(self.retry_queue) >= self._retry_queue_max_size:
+                dropped_group_id, _, _, _ = self.retry_queue.popleft()
+                logger.warning(
+                    f"重试队列已满（max={self._retry_queue_max_size}），已丢弃最旧项（群 {dropped_group_id}）"
+                )
+
+            # 入队副本，避免原对象在外部被修改后影响重试一致性
+            queue_snapshot = copy.deepcopy(messages_dict)
+            self.retry_queue.append((group_id, queue_snapshot, retry_count, time.time()))
             logger.info(f"群 {group_id} 消息已加入重试队列（重试次数: {retry_count}/3）")
+
+    def _refresh_runtime_config_cache(self):
+        """刷新运行时配置缓存（在初始化和周期任务中调用）。"""
+        whitelist_users = self._get_config("whitelist_users", [])
+        enabled_groups = self._get_config("enabled_groups", [])
+
+        self._whitelist_user_ids = {str(user_id) for user_id in whitelist_users}
+        self._enabled_group_ids = {str(group_id) for group_id in enabled_groups}
+        self._group_filter_enabled = bool(self._enabled_group_ids)
 
     async def _process_retry_queue(self):
         """处理重试队列中的消息
@@ -183,7 +211,6 @@ class SpeechCensorshipPlugin(Star):
 
                 # 重新处理这个群组的消息
                 # 为了避免重复进入PROCESSING，我们不再设置处理状态，直接处理
-                lock = await self.message_buffer.get_or_create_lock(group_id)
                 trigger_mode = self._get_config("trigger_mode", "hybrid")
                 recent_limit = int(self._get_config("recent_message_limit", 50)) if trigger_mode == "strict_hybrid" else 0
 
@@ -247,6 +274,8 @@ class SpeechCensorshipPlugin(Star):
 
     async def initialize(self):
         """插件初始化：加载配置、启动定时任务"""
+        self._refresh_runtime_config_cache()
+
         trigger_mode = self._get_config("trigger_mode", "hybrid")
         batch_size = self._get_config("batch_size", 10)
         llm_provider = self._get_config("llm_provider", "")
@@ -472,13 +501,11 @@ class SpeechCensorshipPlugin(Star):
             self.message_buffer.ensure_check_time_initialized(group_id)
 
             # 白名单检查
-            whitelist_users = self._get_config("whitelist_users", [])
-            if user_id in [str(u) for u in whitelist_users]:
+            if user_id in self._whitelist_user_ids:
                 return
 
             # 群组过滤
-            enabled_groups = self._get_config("enabled_groups", [])
-            if enabled_groups and group_id not in [str(g) for g in enabled_groups]:
+            if self._group_filter_enabled and group_id not in self._enabled_group_ids:
                 return
 
             lock = await self.message_buffer.get_or_create_lock(group_id)
@@ -556,6 +583,7 @@ class SpeechCensorshipPlugin(Star):
                 await asyncio.sleep(check_interval)
 
                 logger.debug("执行定时检测...")
+                self._refresh_runtime_config_cache()
 
                 # 首先处理重试队列（如果有）
                 if self.retry_queue:

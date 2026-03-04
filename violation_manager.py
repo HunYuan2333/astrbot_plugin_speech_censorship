@@ -5,9 +5,15 @@ import json
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, TypedDict
 
 from astrbot.api import logger
+
+
+class ViolationRecord(TypedDict):
+    count: int
+    last_time: float
+    created_time: float
 
 
 class ViolationManager:
@@ -32,7 +38,7 @@ class ViolationManager:
         # 用户违规记录
         # 结构: {group_id: {user_id: {"count": int, "last_time": float, "created_time": float}}}
         # 嵌套结构更直观，避免键冲突问题
-        self.records: Dict[str, Dict[str, Dict[str, Any]]] = defaultdict(dict)
+        self.records: Dict[str, Dict[str, ViolationRecord]] = defaultdict(dict)
 
         # 用于保护 records 字典的读写锁
         self._records_lock = asyncio.Lock()
@@ -71,11 +77,7 @@ class ViolationManager:
             for group_id, users in self.records.items():
                 serializable_records[group_id] = {}
                 for user_id, record in users.items():
-                    serializable_records[group_id][user_id] = {
-                        "count": int(record.get("count", 0)),
-                        "last_time": float(record.get("last_time", 0)),
-                        "created_time": float(record.get("created_time", 0))
-                    }
+                    serializable_records[group_id][user_id] = self._normalize_record(record)
 
             await asyncio.to_thread(self._write_records_file, serializable_records)
             logger.debug("已保存违规记录")
@@ -93,6 +95,14 @@ class ViolationManager:
             json.dump(records, f, ensure_ascii=False, indent=2)
 
     @staticmethod
+    def _normalize_record(record: Dict[str, Any]) -> ViolationRecord:
+        return {
+            "count": int(record.get("count", 0)),
+            "last_time": float(record.get("last_time", 0)),
+            "created_time": float(record.get("created_time", 0)),
+        }
+
+    @staticmethod
     def _looks_like_flat_records(data: Dict[str, Any]) -> bool:
         """判断是否为旧版扁平结构：{group_user: {count,...}}"""
         if not data:
@@ -108,9 +118,9 @@ class ViolationManager:
         return flat_like > 0 and flat_like == len(data)
 
     @staticmethod
-    def _normalize_nested_records(data: Dict[str, Any]) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    def _normalize_nested_records(data: Dict[str, Any]) -> Dict[str, Dict[str, ViolationRecord]]:
         """标准化嵌套结构，确保 records 外层/中层类型一致"""
-        normalized: Dict[str, Dict[str, Dict[str, Any]]] = defaultdict(dict)
+        normalized: Dict[str, Dict[str, ViolationRecord]] = defaultdict(dict)
 
         for group_id, users in data.items():
             if not isinstance(group_id, str) or not isinstance(users, dict):
@@ -120,11 +130,7 @@ class ViolationManager:
                 if not isinstance(user_id, str) or not isinstance(record, dict):
                     continue
 
-                normalized[group_id][user_id] = {
-                    "count": int(record.get("count", 0)),
-                    "last_time": float(record.get("last_time", 0)),
-                    "created_time": float(record.get("created_time", 0)),
-                }
+                normalized[group_id][user_id] = ViolationManager._normalize_record(record)
 
         return normalized
 
@@ -142,7 +148,7 @@ class ViolationManager:
 
     def record_violation(self, group_id: str, user_id: str) -> dict:
         """记录一次违规行为（同步版本，调用方负责加锁）"""
-        record = self.records[group_id].get(user_id, {})
+        record = dict(self.records[group_id].get(user_id, self._normalize_record({})))
 
         # 更新违规次数和最后违规时间
         record["count"] = record.get("count", 0) + 1
@@ -152,7 +158,7 @@ class ViolationManager:
         if "created_time" not in record:
             record["created_time"] = time.time()
 
-        self.records[group_id][user_id] = record
+        self.records[group_id][user_id] = self._normalize_record(record)
         return record
 
     async def record_violation_async(self, group_id: str, user_id: str) -> dict:
