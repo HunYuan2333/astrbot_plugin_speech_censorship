@@ -127,11 +127,16 @@ class MessageBuffer:
         if total_count <= limit:
             return
 
-        # 扁平化并排序
+        # 扁平化并排序（修复：规范化 timestamp 类型，防止比较异常）
         flattened = []
         for uid, messages in self.buffer[group_id].items():
             for msg in messages:
-                flattened.append((msg.get("timestamp", 0), uid, msg))
+                raw_timestamp = msg.get("timestamp", 0)
+                try:
+                    timestamp_value = float(raw_timestamp)
+                except (TypeError, ValueError):
+                    timestamp_value = 0.0
+                flattened.append((timestamp_value, uid, msg))
 
         flattened.sort(key=lambda item: item[0])
         recent_items = flattened[-limit:]

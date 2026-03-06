@@ -72,14 +72,16 @@ class ViolationManager:
     async def save_records(self):
         """将违规记录保存到文件"""
         try:
-            # 转换为可序列化的格式
-            serializable_records = {}
-            for group_id, users in self.records.items():
-                serializable_records[group_id] = {}
-                for user_id, record in users.items():
-                    serializable_records[group_id][user_id] = self._normalize_record(record)
+            # 修复：添加锁保护，防止并发读写不一致
+            async with self._records_lock:
+                # 转换为可序列化的格式
+                serializable_records = {}
+                for group_id, users in self.records.items():
+                    serializable_records[group_id] = {}
+                    for user_id, record in users.items():
+                        serializable_records[group_id][user_id] = self._normalize_record(record)
 
-            await asyncio.to_thread(self._write_records_file, serializable_records)
+                await asyncio.to_thread(self._write_records_file, serializable_records)
             logger.debug("已保存违规记录")
         except Exception as e:
             logger.error(f"保存违规记录失败: {e}", exc_info=True)
@@ -148,15 +150,22 @@ class ViolationManager:
 
     def record_violation(self, group_id: str, user_id: str) -> dict:
         """记录一次违规行为（同步版本，调用方负责加锁）"""
-        record = dict(self.records[group_id].get(user_id, self._normalize_record({})))
+        # 修复：先检查是否已有记录，避免 created_time 被错误覆盖为 0
+        existing_record = self.records[group_id].get(user_id)
 
-        # 更新违规次数和最后违规时间
-        record["count"] = record.get("count", 0) + 1
-        record["last_time"] = time.time()
-
-        # 记录创建时间（用于后续过期清理）
-        if "created_time" not in record:
-            record["created_time"] = time.time()
+        if existing_record:
+            # 已有记录，更新次数和时间
+            record = dict(existing_record)
+            record["count"] = record.get("count", 0) + 1
+            record["last_time"] = time.time()
+        else:
+            # 新记录，初始化所有字段
+            now = time.time()
+            record = {
+                "count": 1,
+                "last_time": now,
+                "created_time": now
+            }
 
         self.records[group_id][user_id] = self._normalize_record(record)
         return record

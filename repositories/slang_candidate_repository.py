@@ -58,7 +58,14 @@ class SlangCandidateRepository:
                     continue
 
                 key = term.lower()
-                confidence = float(candidate.get("confidence", 0.0) or 0.0)
+
+                # 修复：添加异常保护，防止 confidence 非数字导致整批失败
+                try:
+                    confidence = float(candidate.get("confidence", 0.0) or 0.0)
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"候选词 '{term}' 的 confidence 无效: {candidate.get('confidence')}，使用默认值 0.0")
+                    confidence = 0.0
+
                 reason = str(candidate.get("reason", "")).strip()
                 category = str(candidate.get("category", "general")).strip() or "general"
                 hint = str(candidate.get("hint", "")).strip()

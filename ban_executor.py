@@ -71,15 +71,14 @@ class BanExecutor:
             logger.error("无法获取 bot 客户端对象")
             return False
 
-        # 获取禁言时长
-        ban_duration = self.get_config("ban_duration", 600)
-
         # 参数类型转换（必须成功）
         try:
             group_id_int = int(group_id)
             user_id_int = int(user_id)
-        except ValueError as ve:
-            logger.error(f"禁言参数类型转换失败 - group_id={group_id}, user_id={user_id}: {ve}")
+            # 修复：添加 ban_duration 类型转换，防止配置为字符串时出错
+            ban_duration = int(self.get_config("ban_duration", 600))
+        except (ValueError, TypeError) as ve:
+            logger.error(f"禁言参数类型转换失败 - group_id={group_id}, user_id={user_id}, ban_duration={self.get_config('ban_duration', 600)}: {ve}")
             return False
 
         logger.info(f"禁言用户 {user_id}（群: {group_id}，原因: {reason}，时长: {ban_duration} 秒）")

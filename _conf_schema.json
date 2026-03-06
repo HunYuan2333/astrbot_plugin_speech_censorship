@@ -126,6 +126,12 @@
     "default": 30,
     "hint": "LLM 调用的超时时间，超过此时间未收到响应则判定为超时，单位为秒"
   },
+  "log_llm_response": {
+    "description": "记录 LLM 原始返回（调试用）",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后会将 LLM 的原始响应输出到日志（DEBUG 级别），用于调试提示词效果和排查解析问题。注意：可能包含敏感内容"
+  },
   "api_timeout_seconds": {
     "description": "平台 API 调用超时（秒）",
     "type": "int",

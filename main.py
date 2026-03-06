@@ -99,6 +99,10 @@ class SpeechCensorshipPlugin(Star):
         self._enabled_group_ids: Set[str] = set()
         self._group_filter_enabled = False
 
+        # 错误记录（用于 status 命令展示最近错误）
+        self.last_errors: Dict[str, Dict[str, Any]] = {}
+        self._last_errors_lock = asyncio.Lock()
+
         # 缓存的导入（用于防止平台耦合）
         self._aiocqhttp_event_class = None
 
@@ -299,6 +303,7 @@ class SpeechCensorshipPlugin(Star):
                         and bool(self._get_config("candidate_discovery_enabled", True))
                     )
                     candidate_discovery_prompt = str(self._get_config("candidate_discovery_prompt", ""))
+                    log_llm_response = bool(self._get_config("log_llm_response", False))
 
                     violations, suspected_slangs, error_code, should_retry = await self.llm_analyzer.analyze_messages(
                         group_id, messages_dict, llm_provider, default_rules, custom_rules,
@@ -306,6 +311,7 @@ class SpeechCensorshipPlugin(Star):
                         retrieval_context=retrieval_context,
                         candidate_discovery_enabled=candidate_discovery_enabled,
                         candidate_discovery_prompt=candidate_discovery_prompt,
+                        log_response=log_llm_response,
                     )
 
                     if candidate_discovery_enabled and suspected_slangs:
@@ -863,8 +869,12 @@ class SpeechCensorshipPlugin(Star):
             if event.get_platform_name() != "aiocqhttp":
                 return
 
-            # 获取消息信息
+            # 获取消息信息（添加空引用保护）
             message_obj = event.message_obj
+            if not message_obj:
+                logger.warning("event.message_obj 为 None，跳过该消息")
+                return
+
             group_id = str(message_obj.group_id) if message_obj.group_id else None
             user_id = str(message_obj.sender.user_id) if message_obj.sender else None
             self_id = str(message_obj.self_id) if getattr(message_obj, "self_id", None) else None
@@ -964,7 +974,7 @@ class SpeechCensorshipPlugin(Star):
         """定时检测任务（用于包含时间条件的模式）"""
         while True:
             try:
-                check_interval = self._get_config("check_interval", 60)
+                check_interval = max(1, int(self._get_config("check_interval", 60)))
                 await asyncio.sleep(check_interval)
 
                 logger.debug("执行定时检测...")
@@ -1092,6 +1102,7 @@ class SpeechCensorshipPlugin(Star):
                     and bool(self._get_config("candidate_discovery_enabled", True))
                 )
                 candidate_discovery_prompt = str(self._get_config("candidate_discovery_prompt", ""))
+                log_llm_response = bool(self._get_config("log_llm_response", False))
 
                 violations, suspected_slangs, error_code, should_retry = await self.llm_analyzer.analyze_messages(
                     group_id, messages_dict, llm_provider, default_rules, custom_rules,
@@ -1099,6 +1110,7 @@ class SpeechCensorshipPlugin(Star):
                     retrieval_context=retrieval_context,
                     candidate_discovery_enabled=candidate_discovery_enabled,
                     candidate_discovery_prompt=candidate_discovery_prompt,
+                    log_response=log_llm_response,
                 )
 
                 if candidate_discovery_enabled and suspected_slangs:
@@ -1107,7 +1119,7 @@ class SpeechCensorshipPlugin(Star):
                         await self.slang_candidate_repository.add_candidates(group_id, filtered_candidates)
                         logger.info(f"群 {group_id} 已写入 {len(filtered_candidates)} 条候选新黑话")
 
-                # 处理 LLM 异常（P0 修复：所有失败都回灌，避免消息丢失）
+                # 处理 LLM 异常（修复双轨回灌问题：重试和回灌二选一）
                 if error_code != "success":
                     logger.warning(f"LLM 分析返回错误: error_code={error_code}, should_retry={should_retry}")
 
@@ -1119,16 +1131,14 @@ class SpeechCensorshipPlugin(Star):
                             "timestamp": time.time()
                         }
 
-                    # CRITICAL: 无论是否重试，都必须回灌消息
-                    async with lock:
-                        self.message_buffer.restore_snapshot(group_id, messages_dict, recent_limit)
-
                     if should_retry:
-                        # 网络临时错误：加入重试队列
+                        # 网络临时错误：仅加入重试队列，不回灌（避免双轨并行）
                         await self._enqueue_retry(group_id, messages_dict, retry_count=0)
-                        logger.info(f"群 {group_id} 消息已回灌并加入重试队列（网络错误，将重试）")
+                        logger.info(f"群 {group_id} 消息已加入重试队列（网络错误，将重试）")
                     else:
-                        # 非临时错误也要回灌，防止消息永久丢失
+                        # 非临时错误：回灌到缓冲区，不重试
+                        async with lock:
+                            self.message_buffer.restore_snapshot(group_id, messages_dict, recent_limit)
                         logger.warning(f"群 {group_id} 分析失败且不重试，消息已回灌到缓冲区")
 
                 self.message_buffer.update_check_time(group_id)

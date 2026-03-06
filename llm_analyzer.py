@@ -12,7 +12,8 @@ from astrbot.api import logger
 JSON_FENCED_BLOCK_PATTERN = re.compile(r'```json\s*\n?(.*?)\n?```', re.DOTALL)
 GENERIC_FENCED_BLOCK_PATTERN = re.compile(r'```\s*\n?(.*?)\n?```', re.DOTALL)
 LANGUAGE_PREFIX_PATTERN = re.compile(r'^(javascript|json|python|js)[\s\n]*', re.IGNORECASE)
-JSON_OBJECT_PATTERN = re.compile(r'\{.*\}', re.DOTALL)
+# 修复：使用非贪婪匹配，防止多个 JSON 对象时误提取
+JSON_OBJECT_PATTERN = re.compile(r'\{.*?\}', re.DOTALL)
 
 
 class LLMAnalyzer:
@@ -169,6 +170,7 @@ class LLMAnalyzer:
         retrieval_context: str = "",
         candidate_discovery_enabled: bool = False,
         candidate_discovery_prompt: str = "",
+        log_response: bool = False,
     ):
         """使用 LLM 分析消息，返回 (violations, suspected_slangs, error_code, should_retry)
 
@@ -218,8 +220,14 @@ class LLMAnalyzer:
 
             result = llm_resp.completion_text if llm_resp else ""
 
-            # 仅记录响应长度以避免敏感内容泄露
+            # 记录响应信息
             logger.info(f"LLM 响应已收到 (长度: {len(result)} 字符)")
+
+            # 可选：记录原始响应（调试用）
+            if log_response:
+                # 限制长度避免日志过大，使用 debug 级别
+                truncated_response = result[:2000] + "..." if len(result) > 2000 else result
+                logger.debug(f"[LLM原始响应] 群={group_id}, 内容:\n{truncated_response}")
 
             # 解析 JSON 响应
             parsed = self.parse_llm_response(result)
@@ -232,18 +240,15 @@ class LLMAnalyzer:
             logger.error(f"LLM 调用超时（>{llm_api_timeout}s），标记为网络错误")
             return [], [], "network_error", True  # 网络临时错误，应该重试
 
-        except ValueError as e:
-            # 配置相关错误
-            if "llm_provider" in str(e).lower() or "context" in str(e).lower():
+        except (json.JSONDecodeError, ValueError) as e:
+            # 修复：合并处理 JSON 解析错误和配置错误
+            error_msg = str(e)
+            if "llm_provider" in error_msg.lower() or "context" in error_msg.lower():
                 logger.error(f"LLM 配置错误: {e}")
                 return [], [], "config_error", False  # 配置错误，不重试
             else:
-                logger.error(f"LLM 值错误: {e}")
-                return [], [], "llm_error", False  # LLM逻辑错误，不重试
-
-        except json.JSONDecodeError as e:
-            logger.error(f"LLM 响应格式错误（JSON解析失败）: {e}")
-            return [], [], "parse_error", False  # 响应格式错误，不重试
+                logger.error(f"LLM 响应格式错误（JSON解析失败）: {e}")
+                return [], [], "parse_error", False  # 响应格式错误，不重试
 
         except Exception as e:
             error_type = type(e).__name__
@@ -280,10 +285,13 @@ class LLMAnalyzer:
                 return [], [], "unknown_error", False  # 未知错误，不重试
 
     def parse_llm_response(self, response: str) -> Dict[str, List[Dict]]:
-        """解析 LLM 响应，提取违规列表与候选新黑话（严格Schema验证 + 防幻觉）"""
+        """解析 LLM 响应，提取违规列表与候选新黑话（严格Schema验证 + 防幻觉）
+
+        修复：解析失败时抛出异常，而不是返回空结构，以便上层能正确处理错误
+        """
         if not isinstance(response, str) or not response.strip():
             logger.error("LLM响应为空或类型错误，无法解析")
-            return {"violations": [], "suspected_slangs": []}
+            raise ValueError("LLM 响应为空或类型错误")
 
         try:
             # 优先尝试直接解析 JSON
@@ -295,7 +303,8 @@ class LLMAnalyzer:
                 data = json.loads(json_str)
             except (ValueError, json.JSONDecodeError) as nested_error:
                 logger.error(f"无法解析LLM响应为JSON: {nested_error}")
-                return {"violations": [], "suspected_slangs": []}
+                # 修复：抛出异常而不是返回空结构
+                raise json.JSONDecodeError(f"JSON 提取失败: {nested_error}", response, 0)
 
         if not isinstance(data, dict):
             logger.error(f"Schema验证失败：LLM顶层JSON不是对象，实际类型: {type(data).__name__}")
