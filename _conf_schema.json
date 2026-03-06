@@ -60,6 +60,54 @@
     "default": "",
     "hint": "仅填写你想额外禁止的内容，插件会自动与默认规则拼接，并固定JSON输出格式。示例：禁止地域黑、引战游戏话题、连续@他人骚扰。"
   },
+  "slang_feature_enabled": {
+    "description": "黑话功能总开关",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后不拼接任何黑话相关提示词（检索增强与候选新黑话发现均停用）"
+  },
+  "slang_detection_enabled": {
+    "description": "启用黑话检索增强",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后在 LLM 审核前增加词库检索证据（命中后仍需 LLM 复核）"
+  },
+  "slang_match_case_sensitive": {
+    "description": "黑话检索区分大小写",
+    "type": "bool",
+    "default": false,
+    "hint": "默认不区分大小写，适合群聊文本场景"
+  },
+  "slang_max_hits": {
+    "description": "单次审核最多注入检索证据条数",
+    "type": "int",
+    "default": 12,
+    "hint": "限制注入到提示词中的命中条数，避免上下文过长"
+  },
+  "candidate_discovery_enabled": {
+    "description": "启用候选新黑话自动发现",
+    "type": "bool",
+    "default": true,
+    "hint": "在常规审核时让 LLM 同步返回疑似新黑话候选，并自动写入候选池"
+  },
+  "candidate_min_confidence": {
+    "description": "候选新黑话最小置信度",
+    "type": "float",
+    "default": 0.75,
+    "hint": "仅保存不低于该置信度的候选新黑话，范围 0.0-1.0"
+  },
+  "candidate_max_items": {
+    "description": "单次审核最多保存候选数",
+    "type": "int",
+    "default": 5,
+    "hint": "每次 LLM 返回候选后最多保留前 N 条高置信候选"
+  },
+  "candidate_discovery_prompt": {
+    "description": "候选新黑话发现提示词",
+    "type": "text",
+    "default": "请额外分析是否存在疑似的网络黑话/隐语，在 JSON 中增加 suspected_slangs 字段。\n\n【黑话识别线索】：\n1. 政治隐喻：用看似无关的事物指代政治人物、事件\n   - 特征：反复出现、上下文带强烈褒贬情感、指代对象不明确\n   - 示例模式：食物名、数字组合、历史人物、地理名词\n   - 关键判断：如果去掉字面意思，整句话失去讽刺/批评意图 → 高度疑似\n\n2. 辱骂代称：用变形、谐音、缩写规避敏感词检测\n   - 示例：拼音缩写（nmsl）、拆字（口区）、谐音（战狼→占狼）\n\n3. 群体暗号：特定圈子内特殊含义的词汇\n   - 示例：饭圈黑话、游戏术语转化、地域梗\n\n【识别要求】：\n- confidence: 置信度 0.0-1.0（需结合上下文情感、出现频率、语义不合理度判断）\n- 政治隐喻置信度建议：如果消息中多次提及且带明显贬义 → 0.8-0.95\n- category: political_metaphor（政治隐喻）| abuse（辱骂）| general（通用黑话）\n- hint: 一句话说明可能的真实指代或隐喻含义\n- reason: 为什么认为是黑话（如：多次出现+贬义语境+语义不合理）\n\n【重要提示】：\n- 正常的日常用语（如真的在讨论鸡蛋、食物）不应识别为黑话\n- 需要结合整个对话的上下文和情感倾向判断\n- 优先识别反复出现的可疑词汇\n\n输出格式示例：\n{\"violations\": [...], \"suspected_slangs\": [{\"term\": \"疑似新词\", \"confidence\": 0.85, \"reason\": \"反复出现+贬义语境+指代不明\", \"category\": \"political_metaphor\", \"hint\": \"可能指代某政治人物\", \"examples\": [\"原文例句1\", \"原文例句2\"]}]}\n\n如果没有疑似黑话，返回 suspected_slangs 为空数组。",
+    "hint": "候选发现任务的完整提示词，可根据实际场景调优（如专注特定类型黑话、调整置信度判断标准等）"
+  },
   "send_warning": {
     "description": "发送警告消息",
     "type": "bool",

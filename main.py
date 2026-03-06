@@ -8,6 +8,7 @@
 
 import asyncio
 import copy
+import shlex
 import time
 from collections import deque
 from pathlib import Path
@@ -21,6 +22,9 @@ from .message_buffer import MessageBuffer
 from .llm_analyzer import LLMAnalyzer
 from .violation_manager import ViolationManager
 from .ban_executor import BanExecutor
+from .repositories import SlangRepository, SlangCandidateRepository
+from .services import HybridRetriever, ReviewContextBuilder
+from .models.slang_entry import GLOBAL_SCOPE
 
 
 class SpeechCensorshipPlugin(Star):
@@ -50,6 +54,12 @@ class SpeechCensorshipPlugin(Star):
 
         # 数据目录
         self.data_dir = self._get_data_dir()
+
+        # 黑话词库与检索服务（并发安全仓储 + 混合检索）
+        self.slang_repository = SlangRepository(self.data_dir)
+        self.slang_candidate_repository = SlangCandidateRepository(self.data_dir)
+        self.hybrid_retriever = HybridRetriever(self.slang_repository)
+        self.review_context_builder = ReviewContextBuilder()
 
         # 违规管理器（延迟初始化在 initialize 中）
         self.violation_manager: Optional[ViolationManager] = None
@@ -189,6 +199,65 @@ class SpeechCensorshipPlugin(Star):
         self._enabled_group_ids = {str(group_id) for group_id in enabled_groups}
         self._group_filter_enabled = bool(self._enabled_group_ids)
 
+    def _is_slang_feature_enabled(self) -> bool:
+        """黑话功能总开关。关闭时不拼接任何黑话相关提示词。"""
+        return bool(self._get_config("slang_feature_enabled", True))
+
+    async def _build_retrieval_context(self, group_id: str, messages_dict: Dict[str, List[Dict]]) -> str:
+        """构建检索增强上下文（失败时降级为空，不影响主链路）。"""
+        if not self._is_slang_feature_enabled():
+            return ""
+
+        slang_detection_enabled = bool(self._get_config("slang_detection_enabled", True))
+        if not slang_detection_enabled:
+            return ""
+
+        case_sensitive = bool(self._get_config("slang_match_case_sensitive", False))
+        slang_max_hits = int(self._get_config("slang_max_hits", 12))
+
+        try:
+            hits = await self.hybrid_retriever.retrieve(
+                group_id=group_id,
+                messages_dict=messages_dict,
+                case_sensitive=case_sensitive,
+                max_hits=slang_max_hits,
+            )
+            return self.review_context_builder.build_slang_context(hits, max_items=slang_max_hits)
+        except Exception as e:
+            logger.error(f"构建检索增强上下文失败（将降级为空）: {e}", exc_info=True)
+            return ""
+
+    def _filter_candidate_slangs(self, candidates: List[Dict]) -> List[Dict]:
+        """按置信度与数量限制筛选候选新黑话。"""
+        if not self._is_slang_feature_enabled():
+            return []
+
+        if not candidates:
+            return []
+
+        min_confidence = float(self._get_config("candidate_min_confidence", 0.75))
+        max_items = int(self._get_config("candidate_max_items", 5))
+
+        filtered = []
+        for candidate in candidates:
+            term = str(candidate.get("term", "")).strip()
+            if not term:
+                continue
+
+            confidence = float(candidate.get("confidence", 0.0) or 0.0)
+            if len(term) <= 1:
+                confidence *= 0.8
+
+            if confidence < min_confidence:
+                continue
+
+            normalized = dict(candidate)
+            normalized["confidence"] = round(confidence, 4)
+            filtered.append(normalized)
+
+        filtered.sort(key=lambda item: float(item.get("confidence", 0.0)), reverse=True)
+        return filtered[: max(1, max_items)]
+
     async def _process_retry_queue(self):
         """处理重试队列中的消息
 
@@ -224,14 +293,39 @@ class SpeechCensorshipPlugin(Star):
                     default_rules = self._get_config("default_review_rules", "")
                     custom_rules = self._get_config("custom_review_rules", "")
                     llm_api_timeout = float(self._get_config("llm_api_timeout", 30))
-
-                    violations, error_code, should_retry = await self.llm_analyzer.analyze_messages(
-                        group_id, messages_dict, llm_provider, default_rules, custom_rules,
-                        llm_api_timeout=llm_api_timeout
+                    retrieval_context = await self._build_retrieval_context(group_id, messages_dict)
+                    candidate_discovery_enabled = (
+                        self._is_slang_feature_enabled()
+                        and bool(self._get_config("candidate_discovery_enabled", True))
                     )
+                    candidate_discovery_prompt = str(self._get_config("candidate_discovery_prompt", ""))
+
+                    violations, suspected_slangs, error_code, should_retry = await self.llm_analyzer.analyze_messages(
+                        group_id, messages_dict, llm_provider, default_rules, custom_rules,
+                        llm_api_timeout=llm_api_timeout,
+                        retrieval_context=retrieval_context,
+                        candidate_discovery_enabled=candidate_discovery_enabled,
+                        candidate_discovery_prompt=candidate_discovery_prompt,
+                    )
+
+                    if candidate_discovery_enabled and suspected_slangs:
+                        filtered_candidates = self._filter_candidate_slangs(suspected_slangs)
+                        if filtered_candidates:
+                            await self.slang_candidate_repository.add_candidates(group_id, filtered_candidates)
+                            logger.info(
+                                f"群 {group_id} 已写入 {len(filtered_candidates)} 条候选新黑话（重试路径）"
+                            )
 
                     # 重新检查重试条件
                     if error_code != "success":
+                        # 记录错误信息
+                        async with self._last_errors_lock:
+                            self.last_errors[group_id] = {
+                                "error_code": error_code,
+                                "error_msg": f"重试失败: {error_code} (尝试 {new_retry_count + 1} 次)",
+                                "timestamp": time.time()
+                            }
+
                         if should_retry and new_retry_count < 3:
                             # 继续重试
                             await self._enqueue_retry(group_id, messages_dict, new_retry_count)
@@ -285,6 +379,12 @@ class SpeechCensorshipPlugin(Star):
         self.violation_manager = ViolationManager(self.data_dir, violation_cooldown_seconds)
         await self.violation_manager.load_records()
 
+        # 初始化黑话词库
+        await self.slang_repository.load()
+
+        # 初始化候选新黑话词库
+        await self.slang_candidate_repository.load()
+
         # 如果触发模式包含时间触发，启动定时器
         if trigger_mode in ["time_only", "hybrid", "strict_hybrid"]:
             self.timer_task = asyncio.create_task(self._periodic_check())
@@ -304,6 +404,7 @@ class SpeechCensorshipPlugin(Star):
         batch_size = self._get_config("batch_size", 10)
         recent_message_limit = self._get_config("recent_message_limit", 50)
         llm_provider = self._get_config("llm_provider", "")
+        slang_feature_enabled = self._is_slang_feature_enabled()
 
         total_groups = len(self.message_buffer.buffer)
         total_messages = sum(
@@ -312,6 +413,29 @@ class SpeechCensorshipPlugin(Star):
         ) if total_groups > 0 else 0
 
         stats = await self.violation_manager.get_stats_async() if self.violation_manager else {}
+        slang_stats = await self.slang_repository.get_stats()
+        candidate_stats = await self.slang_candidate_repository.get_stats()
+
+        # 获取最近的错误信息
+        recent_error_msg = ""
+        async with self._last_errors_lock:
+            if self.last_errors:
+                # 找出最近的错误
+                latest_error = max(self.last_errors.items(), key=lambda x: x[1].get("timestamp", 0))
+                group_id, error_info = latest_error
+                error_code = error_info.get("error_code", "unknown")
+                error_msg = error_info.get("error_msg", "")
+                error_time = time.time() - error_info.get("timestamp", 0)
+
+                # 根据 error_code 提供友好提示
+                if error_code == "balance_insufficient":
+                    recent_error_msg = f"\n\n⚠️ 最近错误（{int(error_time)}秒前）:\n💰 LLM API 余额不足，请充值后重新启用"
+                elif error_code == "auth_error":
+                    recent_error_msg = f"\n\n⚠️ 最近错误（{int(error_time)}秒前）:\n🔑 LLM API 认证失败，请检查 API Key 配置"
+                elif error_code == "rate_limit":
+                    recent_error_msg = f"\n\n⚠️ 最近错误（{int(error_time)}秒前）:\n⏱️ LLM API 速率限制，系统将自动重试"
+                else:
+                    recent_error_msg = f"\n\n⚠️ 最近错误（{int(error_time)}秒前）:\n{error_code}: {error_msg[:100]}"
 
         yield event.plain_result(
             "审核状态:\n"
@@ -320,10 +444,16 @@ class SpeechCensorshipPlugin(Star):
             f"- batch_size: {batch_size}\n"
             f"- recent_message_limit: {recent_message_limit}\n"
             f"- llm_provider: {llm_provider or '未配置'}\n"
+            f"- slang_feature_enabled: {slang_feature_enabled}\n"
             f"- buffer_groups: {total_groups}\n"
             f"- buffer_messages: {total_messages}\n"
             f"- violation_records: {stats.get('total_records', 0)}\n"
-            f"- total_violations: {stats.get('total_violations', 0)}"
+            f"- total_violations: {stats.get('total_violations', 0)}\n"
+            f"- slang_entries: {slang_stats.get('total_entries', 0)}\n"
+            f"- slang_active_entries: {slang_stats.get('active_entries', 0)}\n"
+            f"- slang_candidates: {candidate_stats.get('total_candidates', 0)}\n"
+            f"- pending_candidates: {candidate_stats.get('pending_candidates', 0)}"
+            f"{recent_error_msg}"
         )
 
     @filter.command("censor_prompt_help")
@@ -469,6 +599,261 @@ class SpeechCensorshipPlugin(Star):
         except Exception as e:
             logger.error(f"测试禁言命令执行失败: {e}", exc_info=True)
             yield event.plain_result(f"❌ 命令执行失败：{str(e)}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("slang_add")
+    async def slang_add_command(self, event: AstrMessageEvent):
+        """管理员命令：录入黑话词条
+
+        用法：
+        /slang_add 词条 [--aliases=别名1,别名2] [--category=分类] [--hint=隐喻说明] [--examples=例句1,例句2] [--severity=low|medium|high] [--global]
+        """
+        try:
+            raw_text = (event.message_str or "").strip()
+            tokens = shlex.split(raw_text)
+
+            if len(tokens) < 2:
+                yield event.plain_result(
+                    "❌ 参数不足。\n"
+                    "用法：/slang_add 词条 [--aliases=别名1,别名2] [--category=分类] [--hint=隐喻说明] [--examples=例句1,例句2] [--severity=low|medium|high] [--global]"
+                )
+                return
+
+            canonical_term = ""
+            aliases: List[str] = []
+            category = "general"
+            metaphor_hint = ""
+            context_examples: List[str] = []
+            severity_level = "medium"
+            group_scope = GLOBAL_SCOPE
+
+            for token in tokens[1:]:
+                if token.startswith("--aliases="):
+                    raw_aliases = token.split("=", 1)[1]
+                    aliases = [item.strip() for item in raw_aliases.split(",") if item.strip()]
+                elif token.startswith("--category="):
+                    category_value = token.split("=", 1)[1].strip()
+                    if category_value:
+                        category = category_value
+                elif token.startswith("--hint="):
+                    hint_value = token.split("=", 1)[1].strip()
+                    if hint_value:
+                        metaphor_hint = hint_value
+                elif token.startswith("--examples="):
+                    raw_examples = token.split("=", 1)[1]
+                    context_examples = [item.strip() for item in raw_examples.split(",") if item.strip()]
+                elif token.startswith("--severity="):
+                    severity = token.split("=", 1)[1].strip().lower()
+                    if severity in {"low", "medium", "high"}:
+                        severity_level = severity
+                elif token == "--global":
+                    group_scope = GLOBAL_SCOPE
+                elif token.startswith("--"):
+                    continue
+                elif not canonical_term:
+                    canonical_term = token.strip()
+
+            if not canonical_term:
+                yield event.plain_result("❌ 未提供有效词条。请至少提供一个黑话词条。")
+                return
+
+            if group_scope == GLOBAL_SCOPE:
+                message_obj = getattr(event, "message_obj", None)
+                if message_obj and getattr(message_obj, "group_id", None):
+                    # 默认按当前群覆盖；显式 --global 才使用全局
+                    if "--global" not in tokens[1:]:
+                        group_scope = str(message_obj.group_id)
+
+            operator_id = "system"
+            message_obj = getattr(event, "message_obj", None)
+            if message_obj and getattr(message_obj, "sender", None):
+                operator_id = str(getattr(message_obj.sender, "user_id", "system"))
+
+            entry = await self.slang_repository.upsert_entry(
+                canonical_term=canonical_term,
+                aliases=aliases,
+                category=category,
+                metaphor_hint=metaphor_hint,
+                severity_level=severity_level,
+                action_hint="review",
+                group_scope=group_scope,
+                source="admin_command",
+                context_examples=context_examples,
+                operator=operator_id,
+            )
+
+            scope_text = "全局" if entry.group_scope == GLOBAL_SCOPE else f"群 {entry.group_scope}"
+            yield event.plain_result(
+                "✅ 黑话词条已录入\n"
+                f"- 词条: {entry.canonical_term}\n"
+                f"- 别名: {', '.join(entry.aliases) if entry.aliases else '无'}\n"
+                f"- 分类: {entry.category}\n"
+                f"- 隐喻说明: {entry.metaphor_hint or '无'}\n"
+                f"- 示例: {', '.join(entry.context_examples) if entry.context_examples else '无'}\n"
+                f"- 严重等级: {entry.severity_level}\n"
+                f"- 作用域: {scope_text}\n"
+                f"- 版本: v{entry.version}"
+            )
+
+        except ValueError as e:
+            logger.error(f"录入黑话词条失败（参数/版本）: {e}", exc_info=True)
+            yield event.plain_result(f"❌ 录入失败：{e}")
+        except Exception as e:
+            logger.error(f"录入黑话词条失败: {e}", exc_info=True)
+            yield event.plain_result(f"❌ 录入失败：{e}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("slang_candidates")
+    async def slang_candidates_command(self, event: AstrMessageEvent):
+        """管理员命令：查看候选新黑话
+
+        用法：
+        /slang_candidates [--limit=10] [--all]
+        """
+        try:
+            raw_text = (event.message_str or "").strip()
+            tokens = shlex.split(raw_text)
+
+            limit = 10
+            show_all = False
+
+            for token in tokens[1:]:
+                if token.startswith("--limit="):
+                    try:
+                        limit = max(1, int(token.split("=", 1)[1]))
+                    except ValueError:
+                        limit = 10
+                elif token == "--all":
+                    show_all = True
+
+            candidates = await self.slang_candidate_repository.list_top_candidates(limit=limit * 2)
+            if not show_all:
+                candidates = [item for item in candidates if str(item.get("status", "pending")) == "pending"]
+            candidates = candidates[:limit]
+
+            if not candidates:
+                yield event.plain_result("ℹ️ 当前没有可展示的候选新黑话。")
+                return
+
+            lines = [f"🧩 候选新黑话（展示 {len(candidates)} 条）"]
+            for idx, item in enumerate(candidates, start=1):
+                term = str(item.get("term", "")).strip()
+                category = str(item.get("category", "general")).strip() or "general"
+                confidence = float(item.get("max_confidence", 0.0) or 0.0)
+                count = int(item.get("count", 0) or 0)
+                status = str(item.get("status", "pending") or "pending")
+                hint = str(item.get("hint", "") or "").strip()
+                lines.append(
+                    f"{idx}. {term} | conf={confidence:.2f} | count={count} | category={category} | status={status}"
+                )
+                if hint:
+                    lines.append(f"   hint: {hint}")
+
+            yield event.plain_result("\n".join(lines))
+
+        except Exception as e:
+            logger.error(f"查看候选新黑话失败: {e}", exc_info=True)
+            yield event.plain_result(f"❌ 查看失败：{e}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("slang_promote")
+    async def slang_promote_command(self, event: AstrMessageEvent):
+        """管理员命令：将候选新黑话一键转为正式词条
+
+        用法：
+        /slang_promote 词条 [--severity=low|medium|high] [--global] [--group=群号]
+        """
+        try:
+            raw_text = (event.message_str or "").strip()
+            tokens = shlex.split(raw_text)
+
+            if len(tokens) < 2:
+                yield event.plain_result(
+                    "❌ 参数不足。\n"
+                    "用法：/slang_promote 词条 [--severity=low|medium|high] [--global] [--group=群号]"
+                )
+                return
+
+            term = ""
+            severity_level = "medium"
+            group_scope = ""
+
+            for token in tokens[1:]:
+                if token.startswith("--severity="):
+                    severity = token.split("=", 1)[1].strip().lower()
+                    if severity in {"low", "medium", "high"}:
+                        severity_level = severity
+                elif token == "--global":
+                    group_scope = GLOBAL_SCOPE
+                elif token.startswith("--group="):
+                    custom_group = token.split("=", 1)[1].strip()
+                    if custom_group:
+                        group_scope = custom_group
+                elif token.startswith("--"):
+                    continue
+                elif not term:
+                    term = token.strip()
+
+            if not term:
+                yield event.plain_result("❌ 未提供候选词条。")
+                return
+
+            candidate = await self.slang_candidate_repository.get_candidate(term)
+            if not candidate:
+                yield event.plain_result(f"❌ 未找到候选词条：{term}")
+                return
+
+            if not group_scope:
+                message_obj = getattr(event, "message_obj", None)
+                if message_obj and getattr(message_obj, "group_id", None):
+                    group_scope = str(message_obj.group_id)
+                else:
+                    source_groups = [str(item) for item in candidate.get("source_groups", []) if str(item).strip()]
+                    group_scope = source_groups[0] if source_groups else GLOBAL_SCOPE
+
+            operator_id = "system"
+            message_obj = getattr(event, "message_obj", None)
+            if message_obj and getattr(message_obj, "sender", None):
+                operator_id = str(getattr(message_obj.sender, "user_id", "system"))
+
+            entry = await self.slang_repository.upsert_entry(
+                canonical_term=str(candidate.get("term", "")).strip(),
+                aliases=[],
+                category=str(candidate.get("category", "general") or "general").strip(),
+                metaphor_hint=str(candidate.get("hint", "") or "").strip(),
+                severity_level=severity_level,
+                action_hint="review",
+                group_scope=str(group_scope),
+                source="candidate_promote",
+                context_examples=[
+                    str(item).strip() for item in candidate.get("examples", []) if str(item).strip()
+                ],
+                operator=operator_id,
+            )
+
+            await self.slang_candidate_repository.mark_candidate_status(
+                term=entry.canonical_term,
+                status="promoted",
+                operator=operator_id,
+            )
+
+            scope_text = "全局" if entry.group_scope == GLOBAL_SCOPE else f"群 {entry.group_scope}"
+            yield event.plain_result(
+                "✅ 候选词条已转正\n"
+                f"- 词条: {entry.canonical_term}\n"
+                f"- 分类: {entry.category}\n"
+                f"- 隐喻说明: {entry.metaphor_hint or '无'}\n"
+                f"- 作用域: {scope_text}\n"
+                f"- 严重等级: {entry.severity_level}\n"
+                f"- 版本: v{entry.version}"
+            )
+
+        except ValueError as e:
+            logger.error(f"候选词条转正失败（参数/版本）: {e}", exc_info=True)
+            yield event.plain_result(f"❌ 转正失败：{e}")
+        except Exception as e:
+            logger.error(f"候选词条转正失败: {e}", exc_info=True)
+            yield event.plain_result(f"❌ 转正失败：{e}")
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_message(self, event: AstrMessageEvent):
@@ -701,15 +1086,38 @@ class SpeechCensorshipPlugin(Star):
                 default_rules = self._get_config("default_review_rules", "")
                 custom_rules = self._get_config("custom_review_rules", "")
                 llm_api_timeout = float(self._get_config("llm_api_timeout", 30))
-
-                violations, error_code, should_retry = await self.llm_analyzer.analyze_messages(
-                    group_id, messages_dict, llm_provider, default_rules, custom_rules,
-                    llm_api_timeout=llm_api_timeout
+                retrieval_context = await self._build_retrieval_context(group_id, messages_dict)
+                candidate_discovery_enabled = (
+                    self._is_slang_feature_enabled()
+                    and bool(self._get_config("candidate_discovery_enabled", True))
                 )
+                candidate_discovery_prompt = str(self._get_config("candidate_discovery_prompt", ""))
+
+                violations, suspected_slangs, error_code, should_retry = await self.llm_analyzer.analyze_messages(
+                    group_id, messages_dict, llm_provider, default_rules, custom_rules,
+                    llm_api_timeout=llm_api_timeout,
+                    retrieval_context=retrieval_context,
+                    candidate_discovery_enabled=candidate_discovery_enabled,
+                    candidate_discovery_prompt=candidate_discovery_prompt,
+                )
+
+                if candidate_discovery_enabled and suspected_slangs:
+                    filtered_candidates = self._filter_candidate_slangs(suspected_slangs)
+                    if filtered_candidates:
+                        await self.slang_candidate_repository.add_candidates(group_id, filtered_candidates)
+                        logger.info(f"群 {group_id} 已写入 {len(filtered_candidates)} 条候选新黑话")
 
                 # 处理 LLM 异常（P0 修复：所有失败都回灌，避免消息丢失）
                 if error_code != "success":
                     logger.warning(f"LLM 分析返回错误: error_code={error_code}, should_retry={should_retry}")
+
+                    # 记录错误信息（用于 status 命令展示）
+                    async with self._last_errors_lock:
+                        self.last_errors[group_id] = {
+                            "error_code": error_code,
+                            "error_msg": f"LLM 分析失败: {error_code}",
+                            "timestamp": time.time()
+                        }
 
                     # CRITICAL: 无论是否重试，都必须回灌消息
                     async with lock:

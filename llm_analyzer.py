@@ -35,7 +35,15 @@ class LLMAnalyzer:
         """
         self.context = context
 
-    def build_review_prompt(self, messages_text: str, default_rules: str = "", custom_rules: str = "") -> str:
+    def build_review_prompt(
+        self,
+        messages_text: str,
+        default_rules: str = "",
+        custom_rules: str = "",
+        retrieval_context: str = "",
+        candidate_discovery_enabled: bool = False,
+        candidate_discovery_prompt: str = "",
+    ) -> str:
         """构建审核提示词：默认规则 + 用户自定义规则"""
         rules_block = default_rules.strip()
         if custom_rules.strip():
@@ -62,6 +70,18 @@ class LLMAnalyzer:
             "=" * 60
         )
 
+        retrieval_block = ""
+        if retrieval_context.strip():
+            retrieval_block = (
+                "\n\n"
+                + "=" * 60
+                + "\n【以下为规则检索增强结果，仅作为辅助证据，必须结合完整上下文判断】\n"
+                + "=" * 60
+                + f"\n{retrieval_context.strip()}"
+                + "\n"
+                + "=" * 60
+            )
+
         output_format_requirements = (
             "\n\n请以 JSON 格式返回违规用户列表，格式如下：\n"
             "{\"violations\": [{\"user_id\": \"用户QQ号\", \"reason\": \"具体违规原因\"}]}\n\n"
@@ -74,7 +94,29 @@ class LLMAnalyzer:
             "4. 如果消息本身不违规，返回空列表"
         )
 
-        return f"{final_prompt}{output_format_requirements}"
+        candidate_requirements = ""
+        if candidate_discovery_enabled:
+            if candidate_discovery_prompt.strip():
+                # 使用用户自定义的候选发现提示词
+                candidate_requirements = (
+                    "\n\n" + "=" * 60 + "\n"
+                    "【候选新黑话发现任务 - 仅识别候选，不代表违规结论】\n"
+                    + "=" * 60 + "\n"
+                    + candidate_discovery_prompt.strip() + "\n"
+                    + "=" * 60
+                )
+            else:
+                # 降级使用简化版提示（兼容性保障）
+                candidate_requirements = (
+                    "\n\n同时请尝试发现疑似新黑话（仅候选，不代表违规结论），"
+                    "在 JSON 中增加 suspected_slangs 字段：\n"
+                    "{\"violations\": [...], \"suspected_slangs\": ["
+                    "{\"term\": \"疑似新词\", \"confidence\": 0.0-1.0, \"reason\": \"为什么怀疑\", "
+                    "\"category\": \"分类\", \"hint\": \"隐喻说明\", \"examples\": [\"例句\"]}]}\n"
+                    "如果没有候选新黑话，返回 suspected_slangs 为空数组。"
+                )
+
+        return f"{final_prompt}{retrieval_block}{output_format_requirements}{candidate_requirements}"
 
     def format_messages_for_llm(self, messages_dict: Dict[str, List[Dict]]) -> str:
         """格式化消息用于 LLM 分析（按全局时间排序）
@@ -116,10 +158,19 @@ class LLMAnalyzer:
 
         return "\n".join(lines)
 
-    async def analyze_messages(self, group_id: str, messages_dict: Dict[str, List[Dict]],
-                              llm_provider_name: str, default_rules: str = "",
-                              custom_rules: str = "", llm_api_timeout: float = 30.0):
-        """使用 LLM 分析消息，返回 (violations, error_code, should_retry)
+    async def analyze_messages(
+        self,
+        group_id: str,
+        messages_dict: Dict[str, List[Dict]],
+        llm_provider_name: str,
+        default_rules: str = "",
+        custom_rules: str = "",
+        llm_api_timeout: float = 30.0,
+        retrieval_context: str = "",
+        candidate_discovery_enabled: bool = False,
+        candidate_discovery_prompt: str = "",
+    ):
+        """使用 LLM 分析消息，返回 (violations, suspected_slangs, error_code, should_retry)
 
         Args:
             group_id: 群组 ID
@@ -130,8 +181,9 @@ class LLMAnalyzer:
             llm_api_timeout: LLM API 响应超时时间（秒，默认 30）
 
         Returns:
-            (violations, error_code, should_retry)
+            (violations, suspected_slangs, error_code, should_retry)
             - violations: List[Dict] - 违规列表（解析失败时为[]）
+            - suspected_slangs: List[Dict] - 疑似新黑话候选（解析失败时为[]）
             - error_code: str - 错误代码或"success"
             - should_retry: bool - 是否应该重试
         """
@@ -140,11 +192,18 @@ class LLMAnalyzer:
             messages_text = self.format_messages_for_llm(messages_dict)
 
             # 构造提示词
-            prompt = self.build_review_prompt(messages_text, default_rules, custom_rules)
+            prompt = self.build_review_prompt(
+                messages_text,
+                default_rules,
+                custom_rules,
+                retrieval_context=retrieval_context,
+                candidate_discovery_enabled=candidate_discovery_enabled,
+                candidate_discovery_prompt=candidate_discovery_prompt,
+            )
 
             if not llm_provider_name:
                 logger.warning("未配置 LLM 提供商，跳过检测")
-                return [], "config_error", False  # 配置错误，不重试
+                return [], [], "config_error", False  # 配置错误，不重试
 
             logger.info(f"开始调用 LLM（provider={llm_provider_name}）分析群 {group_id} 消息")
 
@@ -163,47 +222,68 @@ class LLMAnalyzer:
             logger.info(f"LLM 响应已收到 (长度: {len(result)} 字符)")
 
             # 解析 JSON 响应
-            violations = self.parse_llm_response(result)
+            parsed = self.parse_llm_response(result)
+            violations = parsed.get("violations", [])
+            suspected_slangs = parsed.get("suspected_slangs", [])
 
-            return violations, "success", False  # 成功
+            return violations, suspected_slangs, "success", False  # 成功
 
         except asyncio.TimeoutError:
             logger.error(f"LLM 调用超时（>{llm_api_timeout}s），标记为网络错误")
-            return [], "network_error", True  # 网络临时错误，应该重试
+            return [], [], "network_error", True  # 网络临时错误，应该重试
 
         except ValueError as e:
             # 配置相关错误
             if "llm_provider" in str(e).lower() or "context" in str(e).lower():
                 logger.error(f"LLM 配置错误: {e}")
-                return [], "config_error", False  # 配置错误，不重试
+                return [], [], "config_error", False  # 配置错误，不重试
             else:
                 logger.error(f"LLM 值错误: {e}")
-                return [], "llm_error", False  # LLM逻辑错误，不重试
+                return [], [], "llm_error", False  # LLM逻辑错误，不重试
 
         except json.JSONDecodeError as e:
             logger.error(f"LLM 响应格式错误（JSON解析失败）: {e}")
-            return [], "parse_error", False  # 响应格式错误，不重试
+            return [], [], "parse_error", False  # 响应格式错误，不重试
 
         except Exception as e:
             error_type = type(e).__name__
             error_msg = str(e)
 
-            # 尝试判断错误类型
-            if "network" in error_msg.lower() or "connection" in error_msg.lower():
+            # 识别 OpenAI API 错误（APIStatusError、APIError）
+            if "APIStatusError" in error_type or "APIError" in error_type:
+                # 提取错误码
+                if "Error code: 401" in error_msg or "Incorrect API key" in error_msg:
+                    logger.error(f"⚠️ LLM API 认证失败（401）：请检查 API Key 是否正确配置")
+                    return [], [], "auth_error", False  # 认证失败，不重试
+                elif "Error code: 402" in error_msg or "Insufficient Balance" in error_msg:
+                    logger.error(f"💰 LLM API 余额不足（402）：请充值后重新启用审核功能")
+                    return [], [], "balance_insufficient", False  # 余额不足，不重试
+                elif "Error code: 429" in error_msg or "Rate limit" in error_msg:
+                    logger.warning(f"⏱️ LLM API 速率限制（429）：将在重试队列中延迟处理")
+                    return [], [], "rate_limit", True  # 速率限制，应该重试
+                elif "Error code: 5" in error_msg:  # 500/502/503/504
+                    logger.warning(f"🔧 LLM 服务器错误（5xx）：将重试")
+                    return [], [], "server_error", True  # 服务器错误，应该重试
+                else:
+                    logger.error(f"LLM API 错误（{error_type}）: {error_msg}", exc_info=True)
+                    return [], [], "api_error", False  # 其他 API 错误，不重试
+
+            # 通用错误类型判断
+            elif "network" in error_msg.lower() or "connection" in error_msg.lower():
                 logger.error(f"LLM 网络错误（{error_type}）: {e}", exc_info=True)
-                return [], "network_error", True  # 网络错误，应该重试
+                return [], [], "network_error", True  # 网络错误，应该重试
             elif "timeout" in error_msg.lower():
                 logger.error(f"LLM 超时错误（{error_type}）: {e}")
-                return [], "network_error", True  # 视为网络问题，重试
+                return [], [], "network_error", True  # 视为网络问题，重试
             else:
                 logger.error(f"LLM 分析出错（{error_type}）: {e}", exc_info=True)
-                return [], "unknown_error", False  # 未知错误，不重试
+                return [], [], "unknown_error", False  # 未知错误，不重试
 
-    def parse_llm_response(self, response: str) -> List[Dict]:
-        """解析 LLM 响应，提取违规用户列表（严格Schema验证 + 防幻觉）"""
+    def parse_llm_response(self, response: str) -> Dict[str, List[Dict]]:
+        """解析 LLM 响应，提取违规列表与候选新黑话（严格Schema验证 + 防幻觉）"""
         if not isinstance(response, str) or not response.strip():
             logger.error("LLM响应为空或类型错误，无法解析")
-            return []
+            return {"violations": [], "suspected_slangs": []}
 
         try:
             # 优先尝试直接解析 JSON
@@ -215,11 +295,11 @@ class LLMAnalyzer:
                 data = json.loads(json_str)
             except (ValueError, json.JSONDecodeError) as nested_error:
                 logger.error(f"无法解析LLM响应为JSON: {nested_error}")
-                return []
+                return {"violations": [], "suspected_slangs": []}
 
         if not isinstance(data, dict):
             logger.error(f"Schema验证失败：LLM顶层JSON不是对象，实际类型: {type(data).__name__}")
-            return []
+            return {"violations": [], "suspected_slangs": []}
 
         # 提取and验证violations字段
         violations = data.get("violations", [])
@@ -227,7 +307,7 @@ class LLMAnalyzer:
         # 类型验证：violations必须是列表
         if not isinstance(violations, list):
             logger.error(f"Schema验证失败：violations不是列表，实际类型: {type(violations).__name__}")
-            return []
+            return {"violations": [], "suspected_slangs": []}
 
         # 严格Schema验证：每个违规项必须有有效的user_id和reason
         valid_violations = []
@@ -260,13 +340,56 @@ class LLMAnalyzer:
                 "_confidence": "high"  # 标记LLM返回的结果信度为高
             })
 
-        if len(violations) > valid_violations:
+        if len(violations) > len(valid_violations):
             logger.warning(
                 f"LLM响应检验：{len(violations)}→{len(valid_violations)} "
                 f"（{len(violations) - len(valid_violations)}项被过滤）"
             )
 
-        return valid_violations
+        suspected_raw = data.get("suspected_slangs", [])
+        valid_suspected_slangs: List[Dict] = []
+        if isinstance(suspected_raw, list):
+            for idx, item in enumerate(suspected_raw):
+                if not isinstance(item, dict):
+                    logger.warning(f"候选新黑话项 [{idx}] 不是字典对象，跳过")
+                    continue
+
+                term = str(item.get("term", "")).strip()
+                if not term:
+                    continue
+
+                raw_confidence = item.get("confidence", 0.0)
+                try:
+                    confidence = float(raw_confidence)
+                except (TypeError, ValueError):
+                    confidence = 0.0
+                confidence = max(0.0, min(1.0, confidence))
+
+                reason = str(item.get("reason", "")).strip()
+                category = str(item.get("category", "general") or "general").strip()
+                hint = str(item.get("hint", "") or "").strip()
+                examples_raw = item.get("examples", [])
+                examples = (
+                    [str(example).strip() for example in examples_raw if str(example).strip()]
+                    if isinstance(examples_raw, list)
+                    else []
+                )
+
+                valid_suspected_slangs.append(
+                    {
+                        "term": term,
+                        "confidence": confidence,
+                        "reason": reason,
+                        "category": category,
+                        "hint": hint,
+                        "examples": examples,
+                    }
+                )
+
+        return {
+            "violations": valid_violations,
+            "suspected_slangs": valid_suspected_slangs,
+        }
 
     @staticmethod
     def _extract_json_string(response: str) -> str:
